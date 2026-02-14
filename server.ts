@@ -217,65 +217,14 @@ async function handleAirbnbListingDetails(args: any) {
   };
 }
 
-// Create MCP Server with tool handlers
-const server = new Server(
-  {
-    name: "airbnb",
-    version: VERSION,
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  },
-);
-
 log('info', 'Initializing MCP Server', {
   name: 'airbnb',
   version: VERSION,
   ignoreRobotsTxt: IGNORE_ROBOTS_TXT
 });
 
-// Register ListTools handler
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  log('info', 'ListTools request received');
-  return { tools: AIRBNB_TOOLS };
-});
-
-// Register CallTool handler
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  log('info', 'CallTool request received', {
-    tool: request.params.name,
-    arguments: request.params.arguments
-  });
-
-  if (!robotsTxtContent && !IGNORE_ROBOTS_TXT) {
-    await fetchRobotsTxt();
-  }
-
-  switch (request.params.name) {
-    case "airbnb_search":
-      return await handleAirbnbSearch(request.params.arguments);
-    case "airbnb_listing_details":
-      return await handleAirbnbListingDetails(request.params.arguments);
-    default:
-      throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
-  }
-});
-
-// Create transport with stateless JSON-only mode
-// This allows multiple clients and reconnections without session conflicts
-const transport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: undefined, // Stateless mode - no session tracking
-  enableJsonResponse: true, // JSON-only responses, no SSE
-});
-
-log('info', 'Connecting MCP server to StreamableHTTP transport (stateless JSON mode)');
-
-// Connect server to transport
-await server.connect(transport);
-
-log('info', 'MCP server connected to transport successfully');
+// Map to track active sessions
+const transports = new Map<string, StreamableHTTPServerTransport>();
 
 // Create Express app
 const app = express();
@@ -287,27 +236,87 @@ app.get('/health', (req, res) => {
 });
 
 // Route ALL requests (POST for messages, GET for SSE) to the transport
-// The transport handles everything: session management, SSE, JSON-RPC, etc.
+// Session-based SSE mode for ThoughtSpot compatibility
 app.all('/mcp', async (req, res) => {
   log('info', 'Request received on /mcp', {
     method: req.method,
     path: req.path,
     contentType: req.get('content-type'),
-    accept: req.get('accept')
+    accept: req.get('accept'),
+    sessionId: req.headers['mcp-session-id']
   });
 
   try {
-    await transport.handleRequest(req, res);
+    // For POST with no session ID, create a new session
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    if (req.method === 'POST' && !sessionId) {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        enableJsonResponse: false,
+      });
+
+      const mcpServer = new Server(
+        { name: "airbnb", version: VERSION },
+        { capabilities: { tools: {} } }
+      );
+
+      // Register the same handlers on this server instance
+      mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
+        log('info', 'ListTools request received');
+        return { tools: AIRBNB_TOOLS };
+      });
+
+      mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+        log('info', 'CallTool request received', {
+          tool: request.params.name,
+          arguments: request.params.arguments
+        });
+        if (!robotsTxtContent && !IGNORE_ROBOTS_TXT) {
+          await fetchRobotsTxt();
+        }
+        switch (request.params.name) {
+          case "airbnb_search":
+            return await handleAirbnbSearch(request.params.arguments);
+          case "airbnb_listing_details":
+            return await handleAirbnbListingDetails(request.params.arguments);
+          default:
+            throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
+        }
+      });
+
+      await mcpServer.connect(transport);
+
+      // Store transport by session ID after handling (session ID set in response)
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) transports.delete(sid);
+        log('info', 'Session closed', { sessionId: sid });
+      };
+
+      await transport.handleRequest(req, res);
+
+      if (transport.sessionId) {
+        transports.set(transport.sessionId, transport);
+        log('info', 'New session created', { sessionId: transport.sessionId });
+      }
+      return;
+    }
+
+    // For requests with a session ID, look up existing transport
+    if (sessionId && transports.has(sessionId)) {
+      await transports.get(sessionId)!.handleRequest(req, res);
+      return;
+    }
+
+    // Unknown session
+    res.status(400).json({ error: 'Invalid or missing session' });
   } catch (error) {
     log('error', 'Transport error', {
       error: error instanceof Error ? error.message : String(error),
     });
-
     if (!res.headersSent) {
-      res.status(500).json({
-        error: 'Transport error',
-        details: error instanceof Error ? error.message : String(error)
-      });
+      res.status(500).json({ error: 'Transport error' });
     }
   }
 });
