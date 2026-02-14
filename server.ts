@@ -230,55 +230,31 @@ log('info', 'Initializing MCP Server', {
   ignoreRobotsTxt: IGNORE_ROBOTS_TXT
 });
 
-// Create MCP Server with tool handlers
-const server = new Server(
-  {
-    name: "airbnb",
-    version: VERSION,
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  },
-);
-
-// Register ListTools handler
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  log('info', 'ListTools request received');
-  return { tools: AIRBNB_TOOLS };
-});
-
-// Register CallTool handler
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  log('info', 'CallTool request received', {
-    tool: request.params.name,
-    arguments: request.params.arguments
+// Keep the tool handlers as functions so we can reuse them
+function registerHandlers(mcpServer: Server) {
+  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
+    log('info', 'ListTools request received');
+    return { tools: AIRBNB_TOOLS };
   });
 
-  if (!robotsTxtContent && !IGNORE_ROBOTS_TXT) {
-    await fetchRobotsTxt();
-  }
-
-  switch (request.params.name) {
-    case "airbnb_search":
-      return await handleAirbnbSearch(request.params.arguments);
-    case "airbnb_listing_details":
-      return await handleAirbnbListingDetails(request.params.arguments);
-    default:
-      throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
-  }
-});
-
-// Single global transport - stateless JSON mode (matches Cam's working Lex server pattern)
-const transport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: undefined,
-  enableJsonResponse: true,
-});
-
-await server.connect(transport);
-
-log('info', 'MCP server connected to transport (stateless JSON mode)');
+  mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+    log('info', 'CallTool request received', {
+      tool: request.params.name,
+      arguments: request.params.arguments
+    });
+    if (!robotsTxtContent && !IGNORE_ROBOTS_TXT) {
+      await fetchRobotsTxt();
+    }
+    switch (request.params.name) {
+      case "airbnb_search":
+        return await handleAirbnbSearch(request.params.arguments);
+      case "airbnb_listing_details":
+        return await handleAirbnbListingDetails(request.params.arguments);
+      default:
+        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
+    }
+  });
+}
 
 // Create Express app
 const app = express();
@@ -299,14 +275,25 @@ app.all('/mcp', async (req, res) => {
   });
 
   try {
+    const server = new Server(
+      { name: "airbnb", version: VERSION },
+      { capabilities: { tools: {} } }
+    );
+    registerHandlers(server);
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+
+    await server.connect(transport);
     await transport.handleRequest(req, res);
     log('info', 'Request handled successfully', { statusCode: res.statusCode });
   } catch (error) {
     console.error('FULL TRANSPORT ERROR:', error);
     log('error', 'Transport error', {
       error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-      name: error instanceof Error ? error.name : undefined
+      stack: error instanceof Error ? error.stack : undefined
     });
     if (!res.headersSent) {
       res.status(500).json({
