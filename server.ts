@@ -296,40 +296,11 @@ app.all('/mcp', async (req, res) => {
     accept: req.get('accept')
   });
 
-  // Intercept response to log what's being sent back
-  const originalWrite = res.write.bind(res);
-  const originalEnd = res.end.bind(res);
-  let responseBody = '';
-
-  res.write = function(chunk: any, ...args: any[]) {
-    if (chunk) {
-      responseBody += chunk.toString();
-    }
-    return originalWrite(chunk, ...args);
-  };
-
-  res.end = function(chunk: any, ...args: any[]) {
-    if (chunk) {
-      responseBody += chunk.toString();
-    }
-
-    log('info', 'Response sent from /mcp', {
-      statusCode: res.statusCode,
-      headers: res.getHeaders(),
-      body: responseBody ? (responseBody.length > 500 ? responseBody.substring(0, 500) + '... (truncated)' : responseBody) : undefined
-    });
-
-    return originalEnd(chunk, ...args);
-  };
-
   try {
-    // Pass raw request directly to transport - do NOT read or parse body!
-    // The SDK needs the raw request stream to parse JSON-RPC
     await transport.handleRequest(req, res);
   } catch (error) {
     log('error', 'Transport error', {
       error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined
     });
 
     if (!res.headersSent) {
