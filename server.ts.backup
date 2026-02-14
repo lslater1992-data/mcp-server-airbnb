@@ -1,0 +1,1162 @@
+#!/usr/bin/env node
+
+/**
+ * Streamable HTTP Transport Wrapper for Airbnb MCP Server
+ * This file wraps the existing MCP server with Streamable HTTP transport for Railway deployment
+ */
+
+import express from 'express';
+import { randomUUID } from 'crypto';
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  Tool,
+  McpError,
+  ErrorCode,
+} from "@modelcontextprotocol/sdk/types.js";
+import fetch from "node-fetch";
+import * as cheerio from "cheerio";
+import { cleanObject, flattenArraysInObject, pickBySchema } from "./util.js";
+import robotsParser from "robots-parser";
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+// Get version from package.json
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+function getVersion(): string {
+  try {
+    const packageJson = JSON.parse(readFileSync(join(__dirname, '../package.json'), 'utf8'));
+    return process.env.MCP_SERVER_VERSION || packageJson.version || "unknown";
+  } catch (error) {
+    return process.env.MCP_SERVER_VERSION || "unknown";
+  }
+}
+
+const VERSION = getVersion();
+
+// Tool definitions (same as index.ts)
+const AIRBNB_SEARCH_TOOL: Tool = {
+  name: "airbnb_search",
+  description: "Search for Airbnb listings with various filters and pagination. Provide direct links to the user",
+  inputSchema: {
+    type: "object",
+    properties: {
+      location: {
+        type: "string",
+        description: "Location to search for (city, state, etc.)"
+      },
+      placeId: {
+        type: "string",
+        description: "Google Maps Place ID (overrides the location parameter)"
+      },
+      checkin: {
+        type: "string",
+        description: "Check-in date (YYYY-MM-DD)"
+      },
+      checkout: {
+        type: "string",
+        description: "Check-out date (YYYY-MM-DD)"
+      },
+      adults: {
+        type: "number",
+        description: "Number of adults"
+      },
+      children: {
+        type: "number",
+        description: "Number of children"
+      },
+      infants: {
+        type: "number",
+        description: "Number of infants"
+      },
+      pets: {
+        type: "number",
+        description: "Number of pets"
+      },
+      minPrice: {
+        type: "number",
+        description: "Minimum price for the stay"
+      },
+      maxPrice: {
+        type: "number",
+        description: "Maximum price for the stay"
+      },
+      cursor: {
+        type: "string",
+        description: "Base64-encoded string used for Pagination"
+      },
+      ignoreRobotsText: {
+        type: "boolean",
+        description: "Ignore robots.txt rules for this request"
+      }
+    },
+    required: ["location"]
+  }
+};
+
+const AIRBNB_LISTING_DETAILS_TOOL: Tool = {
+  name: "airbnb_listing_details",
+  description: "Get detailed information about a specific Airbnb listing. Provide direct links to the user",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: {
+        type: "string",
+        description: "The Airbnb listing ID"
+      },
+      checkin: {
+        type: "string",
+        description: "Check-in date (YYYY-MM-DD)"
+      },
+      checkout: {
+        type: "string",
+        description: "Check-out date (YYYY-MM-DD)"
+      },
+      adults: {
+        type: "number",
+        description: "Number of adults"
+      },
+      children: {
+        type: "number",
+        description: "Number of children"
+      },
+      infants: {
+        type: "number",
+        description: "Number of infants"
+      },
+      pets: {
+        type: "number",
+        description: "Number of pets"
+      },
+      ignoreRobotsText: {
+        type: "boolean",
+        description: "Ignore robots.txt rules for this request"
+      }
+    },
+    required: ["id"]
+  }
+};
+
+const AIRBNB_TOOLS = [
+  AIRBNB_SEARCH_TOOL,
+  AIRBNB_LISTING_DETAILS_TOOL,
+] as const;
+
+// Utility functions
+const USER_AGENT = "ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)";
+const BASE_URL = "https://www.airbnb.com";
+
+const IGNORE_ROBOTS_TXT = process.env.IGNORE_ROBOTS_TXT === "true";
+const robotsErrorMessage = "This path is disallowed by Airbnb's robots.txt to this User-agent. You may or may not want to set IGNORE_ROBOTS_TXT=true environment variable";
+let robotsTxtContent = "";
+
+// Logging function with better formatting
+function log(level: 'info' | 'warn' | 'error', message: string, data?: any) {
+  const timestamp = new Date().toISOString();
+  const logMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
+
+  if (data) {
+    console.log(`${logMessage}:`, JSON.stringify(data, null, 2));
+  } else {
+    console.log(logMessage);
+  }
+}
+
+// Robots.txt handling
+async function fetchRobotsTxt() {
+  if (IGNORE_ROBOTS_TXT) {
+    log('info', 'Skipping robots.txt fetch (ignored by configuration)');
+    return;
+  }
+
+  try {
+    log('info', 'Fetching robots.txt from Airbnb');
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    const response = await fetch(`${BASE_URL}/robots.txt`, {
+      headers: {
+        "User-Agent": USER_AGENT,
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    robotsTxtContent = await response.text();
+    log('info', 'Successfully fetched robots.txt');
+  } catch (error) {
+    log('warn', 'Error fetching robots.txt, assuming all paths allowed', {
+      error: error instanceof Error ? error.message : String(error)
+    });
+    robotsTxtContent = "";
+  }
+}
+
+function isPathAllowed(path: string): boolean {
+  if (!robotsTxtContent) {
+    return true;
+  }
+
+  try {
+    const robots = robotsParser(`${BASE_URL}/robots.txt`, robotsTxtContent);
+    const allowed = robots.isAllowed(path, USER_AGENT);
+
+    if (!allowed) {
+      log('warn', 'Path disallowed by robots.txt', { path, userAgent: USER_AGENT });
+    }
+
+    return allowed;
+  } catch (error) {
+    log('warn', 'Error parsing robots.txt, allowing path', {
+      path,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return true;
+  }
+}
+
+async function fetchWithUserAgent(url: string, timeout: number = 30000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Cache-Control": "no-cache",
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`Request timeout after ${timeout}ms`);
+    }
+
+    throw error;
+  }
+}
+
+// Import handler functions from index.ts (duplicated here for standalone operation)
+async function handleAirbnbSearch(params: any) {
+  const {
+    location,
+    placeId,
+    checkin,
+    checkout,
+    adults = 1,
+    children = 0,
+    infants = 0,
+    pets = 0,
+    minPrice,
+    maxPrice,
+    cursor,
+    ignoreRobotsText = false,
+  } = params;
+
+  log('info', 'Processing Airbnb search request', {
+    location,
+    checkin,
+    checkout,
+    adults,
+    children,
+    placeId: placeId || 'none'
+  });
+
+  const searchUrl = new URL(`${BASE_URL}/s/${encodeURIComponent(location)}/homes`);
+
+  if (placeId) searchUrl.searchParams.append("place_id", placeId);
+  if (checkin) searchUrl.searchParams.append("checkin", checkin);
+  if (checkout) searchUrl.searchParams.append("checkout", checkout);
+
+  const adults_int = parseInt(adults.toString());
+  const children_int = parseInt(children.toString());
+  const infants_int = parseInt(infants.toString());
+  const pets_int = parseInt(pets.toString());
+
+  const totalGuests = adults_int + children_int;
+  if (totalGuests > 0) {
+    searchUrl.searchParams.append("adults", adults_int.toString());
+    searchUrl.searchParams.append("children", children_int.toString());
+    searchUrl.searchParams.append("infants", infants_int.toString());
+    searchUrl.searchParams.append("pets", pets_int.toString());
+  }
+
+  if (minPrice) searchUrl.searchParams.append("price_min", minPrice.toString());
+  if (maxPrice) searchUrl.searchParams.append("price_max", maxPrice.toString());
+  if (cursor) searchUrl.searchParams.append("cursor", cursor);
+
+  log('info', 'Built search URL', { url: searchUrl.toString() });
+
+  const path = searchUrl.pathname + searchUrl.search;
+  if (!ignoreRobotsText && !isPathAllowed(path)) {
+    log('warn', 'Search blocked by robots.txt', { path, url: searchUrl.toString() });
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          error: robotsErrorMessage,
+          url: searchUrl.toString(),
+        }, null, 2)
+      }],
+      isError: true
+    };
+  }
+
+  const allowSearchResultSchema: Record<string, any> = {
+    demandStayListing : {
+      id: true,
+      description: true,
+      location: true,
+    },
+    badges: {
+      text: true,
+    },
+    structuredContent: {
+      mapCategoryInfo: {
+        body: true
+      },
+      mapSecondaryLine: {
+        body: true
+      },
+      primaryLine: {
+        body: true
+      },
+      secondaryLine: {
+        body: true
+      },
+    },
+    avgRatingA11yLabel: true,
+    listingParamOverrides: true,
+    structuredDisplayPrice: {
+      primaryLine: {
+        accessibilityLabel: true,
+      },
+      secondaryLine: {
+        accessibilityLabel: true,
+      },
+      explanationData: {
+        title: true,
+        priceDetails: {
+          items: {
+            description: true,
+            priceString: true
+          }
+        }
+      }
+    },
+  };
+
+  try {
+    log('info', 'Fetching Airbnb search page');
+
+    const response = await fetchWithUserAgent(searchUrl.toString());
+    const html = await response.text();
+
+    log('info', 'Received HTML response', {
+      size: html.length,
+      preview: html.substring(0, 200)
+    });
+
+    const $ = cheerio.load(html);
+
+    let staysSearchResults: any = {};
+
+    try {
+      const scriptElement = $("#data-deferred-state-0").first();
+      if (scriptElement.length === 0) {
+        log('error', 'Could not find data script element');
+        throw new Error("Could not find data script element - page structure may have changed");
+      }
+
+      const scriptContent = $(scriptElement).text();
+      if (!scriptContent) {
+        log('error', 'Data script element is empty');
+        throw new Error("Data script element is empty");
+      }
+
+      log('info', 'Found data script element', {
+        contentLength: scriptContent.length
+      });
+
+      const clientData = JSON.parse(scriptContent).niobeClientData[0][1];
+      const results = clientData.data.presentation.staysSearch.results;
+      cleanObject(results);
+
+      staysSearchResults = {
+        searchResults: results.searchResults
+          .map((result: any) => flattenArraysInObject(pickBySchema(result, allowSearchResultSchema)))
+          .map((result: any) => {
+            const id = atob(result.demandStayListing.id).split(":")[1];
+            return {id, url: `${BASE_URL}/rooms/${id}`, ...result }
+          }),
+        paginationInfo: results.paginationInfo
+      }
+
+      log('info', 'Search completed successfully', {
+        resultCount: staysSearchResults.searchResults?.length || 0
+      });
+    } catch (parseError) {
+      log('error', 'Failed to parse search results', {
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+        stack: parseError instanceof Error ? parseError.stack : undefined,
+        url: searchUrl.toString()
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            error: "Failed to parse search results from Airbnb. The page structure may have changed.",
+            details: parseError instanceof Error ? parseError.message : String(parseError),
+            searchUrl: searchUrl.toString()
+          }, null, 2)
+        }],
+        isError: true
+      };
+    }
+
+    const successResponse = {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          searchUrl: searchUrl.toString(),
+          ...staysSearchResults
+        }, null, 2)
+      }],
+      isError: false
+    };
+
+    log('info', 'Returning search results', {
+      contentLength: successResponse.content[0].text.length,
+      preview: successResponse.content[0].text.substring(0, 300)
+    });
+
+    return successResponse;
+  } catch (error) {
+    log('error', 'Search request failed', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      url: searchUrl.toString()
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          error: error instanceof Error ? error.message : String(error),
+          searchUrl: searchUrl.toString(),
+          timestamp: new Date().toISOString()
+        }, null, 2)
+      }],
+      isError: true
+    };
+  }
+}
+
+async function handleAirbnbListingDetails(params: any) {
+  const {
+    id,
+    checkin,
+    checkout,
+    adults = 1,
+    children = 0,
+    infants = 0,
+    pets = 0,
+    ignoreRobotsText = false,
+  } = params;
+
+  log('info', 'Processing listing details request', { id, checkin, checkout });
+
+  const listingUrl = new URL(`${BASE_URL}/rooms/${id}`);
+
+  if (checkin) listingUrl.searchParams.append("check_in", checkin);
+  if (checkout) listingUrl.searchParams.append("check_out", checkout);
+
+  const adults_int = parseInt(adults.toString());
+  const children_int = parseInt(children.toString());
+  const infants_int = parseInt(infants.toString());
+  const pets_int = parseInt(pets.toString());
+
+  const totalGuests = adults_int + children_int;
+  if (totalGuests > 0) {
+    listingUrl.searchParams.append("adults", adults_int.toString());
+    listingUrl.searchParams.append("children", children_int.toString());
+    listingUrl.searchParams.append("infants", infants_int.toString());
+    listingUrl.searchParams.append("pets", pets_int.toString());
+  }
+
+  log('info', 'Built listing URL', { url: listingUrl.toString() });
+
+  const path = listingUrl.pathname + listingUrl.search;
+  if (!ignoreRobotsText && !isPathAllowed(path)) {
+    log('warn', 'Listing details blocked by robots.txt', { path, url: listingUrl.toString() });
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          error: robotsErrorMessage,
+          url: listingUrl.toString(),
+        }, null, 2)
+      }],
+      isError: true
+    };
+  }
+
+  const allowSectionSchema: Record<string, any> = {
+    "LOCATION_DEFAULT": {
+      lat: true,
+      lng: true,
+      subtitle: true,
+      title: true
+    },
+    "POLICIES_DEFAULT": {
+      title: true,
+      houseRulesSections: {
+        title: true,
+        items : {
+          title: true
+        }
+      }
+    },
+    "HIGHLIGHTS_DEFAULT": {
+      highlights: {
+        title: true
+      }
+    },
+    "DESCRIPTION_DEFAULT": {
+      htmlDescription: {
+        htmlText: true
+      }
+    },
+    "AMENITIES_DEFAULT": {
+      title: true,
+      seeAllAmenitiesGroups: {
+        title: true,
+        amenities: {
+          title: true
+        }
+      }
+    },
+  };
+
+  try {
+    log('info', 'Fetching listing details page');
+
+    const response = await fetchWithUserAgent(listingUrl.toString());
+    const html = await response.text();
+
+    log('info', 'Received HTML response', { size: html.length });
+
+    const $ = cheerio.load(html);
+
+    let details = {};
+
+    try {
+      const scriptElement = $("#data-deferred-state-0").first();
+      if (scriptElement.length === 0) {
+        log('error', 'Could not find data script element');
+        throw new Error("Could not find data script element - page structure may have changed");
+      }
+
+      const scriptContent = $(scriptElement).text();
+      if (!scriptContent) {
+        log('error', 'Data script element is empty');
+        throw new Error("Data script element is empty");
+      }
+
+      log('info', 'Found data script element', { contentLength: scriptContent.length });
+
+      const clientData = JSON.parse(scriptContent).niobeClientData[0][1];
+      const sections = clientData.data.presentation.stayProductDetailPage.sections.sections;
+      sections.forEach((section: any) => cleanObject(section));
+
+      details = sections
+        .filter((section: any) => allowSectionSchema.hasOwnProperty(section.sectionId))
+        .map((section: any) => {
+          return {
+            id: section.sectionId,
+            ...flattenArraysInObject(pickBySchema(section.section, allowSectionSchema[section.sectionId]))
+          }
+        });
+
+      log('info', 'Listing details fetched successfully', {
+        id,
+        sectionsFound: Array.isArray(details) ? details.length : 0
+      });
+    } catch (parseError) {
+      log('error', 'Failed to parse listing details', {
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+        stack: parseError instanceof Error ? parseError.stack : undefined,
+        id,
+        url: listingUrl.toString()
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            error: "Failed to parse listing details from Airbnb. The page structure may have changed.",
+            details: parseError instanceof Error ? parseError.message : String(parseError),
+            listingUrl: listingUrl.toString()
+          }, null, 2)
+        }],
+        isError: true
+      };
+    }
+
+    const successResponse = {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          listingUrl: listingUrl.toString(),
+          details: details
+        }, null, 2)
+      }],
+      isError: false
+    };
+
+    log('info', 'Returning listing details', {
+      contentLength: successResponse.content[0].text.length
+    });
+
+    return successResponse;
+  } catch (error) {
+    log('error', 'Listing details request failed', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      id,
+      url: listingUrl.toString()
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          error: error instanceof Error ? error.message : String(error),
+          listingUrl: listingUrl.toString(),
+          timestamp: new Date().toISOString()
+        }, null, 2)
+      }],
+      isError: true
+    };
+  }
+}
+
+/**
+ * Factory function to create a fresh MCP Server instance
+ * Each connection needs its own Server instance per SDK requirements
+ */
+function createMCPServer(): Server {
+  const server = new Server(
+    {
+      name: "airbnb",
+      version: VERSION,
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
+    },
+  );
+
+  // Register ListTools handler
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    log('info', 'ListTools request received');
+    const response = { tools: AIRBNB_TOOLS };
+    log('info', 'Returning tools list', { toolCount: AIRBNB_TOOLS.length });
+    return response;
+  });
+
+  // Register CallTool handler
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const startTime = Date.now();
+
+    log('info', 'CallTool request received', {
+      tool: request.params.name,
+      arguments: request.params.arguments
+    });
+
+    try {
+      if (!request.params.name) {
+        throw new McpError(ErrorCode.InvalidParams, "Tool name is required");
+      }
+
+      if (!request.params.arguments) {
+        throw new McpError(ErrorCode.InvalidParams, "Tool arguments are required");
+      }
+
+      if (!robotsTxtContent && !IGNORE_ROBOTS_TXT) {
+        await fetchRobotsTxt();
+      }
+
+      let result;
+      switch (request.params.name) {
+        case "airbnb_search": {
+          log('info', 'Executing airbnb_search handler');
+          result = await handleAirbnbSearch(request.params.arguments);
+          break;
+        }
+
+        case "airbnb_listing_details": {
+          log('info', 'Executing airbnb_listing_details handler');
+          result = await handleAirbnbListingDetails(request.params.arguments);
+          break;
+        }
+
+        default:
+          throw new McpError(
+            ErrorCode.MethodNotFound,
+            `Unknown tool: ${request.params.name}`
+          );
+      }
+
+      const duration = Date.now() - startTime;
+      log('info', 'Tool call completed successfully', {
+        tool: request.params.name,
+        duration: `${duration}ms`,
+        success: !result.isError,
+        resultPreview: JSON.stringify(result).substring(0, 200)
+      });
+
+      return result;
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      log('error', 'Tool call failed', {
+        tool: request.params.name,
+        duration: `${duration}ms`,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      });
+
+      if (error instanceof McpError) {
+        throw error;
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            error: error instanceof Error ? error.message : String(error),
+            timestamp: new Date().toISOString()
+          }, null, 2)
+        }],
+        isError: true
+      };
+    }
+  });
+
+  return server;
+}
+
+log('info', 'MCP Server factory initialized', {
+  name: 'airbnb',
+  version: VERSION,
+  ignoreRobotsTxt: IGNORE_ROBOTS_TXT
+});
+
+// HTTP Server Setup
+const app = express();
+const PORT = process.env.PORT || 8080;
+
+// Store active sessions (Server + transport) by session ID
+const activeSessions = new Map<string, {
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+}>();
+
+// Store the most recent session created from a POST (before GET subscribes to it)
+let pendingSession: { server: Server; transport: StreamableHTTPServerTransport; sessionId: string } | null = null;
+
+// Middleware to parse JSON
+app.use(express.json());
+
+// Request logging middleware
+app.use((req, res, next) => {
+  log('info', 'Incoming HTTP request', {
+    method: req.method,
+    path: req.path,
+    query: req.query,
+    headers: {
+      'content-type': req.get('content-type'),
+      'user-agent': req.get('user-agent')
+    }
+  });
+  next();
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  log('info', 'Health check requested');
+  res.json({
+    status: 'healthy',
+    version: VERSION,
+    timestamp: new Date().toISOString(),
+    activeConnections: activeSessions.size
+  });
+});
+
+// Root endpoint - GET with SSE upgrade or info, POST handles JSON-RPC
+app.get('/', async (req, res) => {
+  const acceptHeader = req.get('accept') || '';
+
+  log('info', 'Root endpoint accessed via GET', {
+    userAgent: req.get('user-agent'),
+    acceptHeader,
+    query: req.query,
+    isSSERequest: acceptHeader.includes('text/event-stream')
+  });
+
+  // If client requests streaming (Accept: text/event-stream), open Streamable HTTP connection
+  if (acceptHeader.includes('text/event-stream')) {
+    log('info', 'GET / SSE stream requested', {
+      userAgent: req.get('user-agent'),
+      ip: req.ip,
+      hasPendingSession: !!pendingSession
+    });
+
+    try {
+      let sessionId: string | undefined;
+      let transport: StreamableHTTPServerTransport;
+
+      // Check if there's a pending session from a previous POST / initialize
+      if (pendingSession) {
+        log('info', 'Reusing existing Server and transport from POST / initialize', {
+          sessionId: pendingSession.sessionId
+        });
+
+        transport = pendingSession.transport;
+        sessionId = pendingSession.sessionId;
+        pendingSession = null; // Clear the pending session
+
+      } else {
+        // No pending session - create a new Server and transport
+        log('info', 'Creating new MCP Server and transport for GET /');
+
+        // Create a fresh Server instance for this connection
+        const mcpServer = createMCPServer();
+
+        const newSessionId = randomUUID();
+        sessionId = newSessionId;
+
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => newSessionId,
+          onsessioninitialized: (sid) => {
+            log('info', 'Session initialized from GET /', { sessionId: sid });
+          }
+        });
+
+        // Store the session
+        activeSessions.set(newSessionId, { server: mcpServer, transport });
+
+        log('info', 'Connecting new Server instance to transport');
+        await mcpServer.connect(transport);
+      }
+
+      // Set up event handlers to track connection lifecycle
+      req.on('close', () => {
+        if (sessionId) {
+          log('info', 'SSE stream closed', {
+            sessionId,
+            remainingConnections: activeSessions.size - 1
+          });
+          activeSessions.delete(sessionId);
+        }
+      });
+
+      req.on('error', (error) => {
+        if (sessionId) {
+          log('error', 'SSE stream error', {
+            sessionId,
+            error: error.message,
+            stack: error.stack
+          });
+          activeSessions.delete(sessionId);
+        }
+      });
+
+      // Let the StreamableHTTP transport handle everything (headers, response, stream)
+      // Do NOT set any headers or write to the response manually
+      log('info', 'Passing GET request to transport for SSE handling', { sessionId });
+
+      // The transport handles the full SSE lifecycle - don't await, let it stay open
+      transport.handleRequest(req, res).catch((error) => {
+        log('error', 'SSE transport error', {
+          sessionId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+
+      log('info', 'SSE stream handed to transport', {
+        sessionId,
+        totalActiveConnections: activeSessions.size
+      });
+
+    } catch (error) {
+      log('error', 'Failed to establish Streamable HTTP connection', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      });
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: 'Failed to establish Streamable HTTP connection',
+          details: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  } else {
+    // Regular GET request - return server info
+    log('info', 'Returning server info (no SSE upgrade requested)');
+
+    res.json({
+      name: 'Airbnb MCP Server',
+      version: VERSION,
+      transport: 'streamable-http',
+      protocolVersion: '2024-11-05 / 2025-06-18',
+      capabilities: {
+        tools: {
+          airbnb_search: 'Search Airbnb listings',
+          airbnb_listing_details: 'Get detailed listing information'
+        }
+      },
+      endpoints: {
+        stream: 'GET / with Accept: text/event-stream (opens Streamable HTTP connection)',
+        messages: 'POST / with mcp-session-id header (all MCP protocol messages)',
+        alternateMessages: 'POST /message (alternative endpoint for messages)',
+        info: 'GET / (this page)',
+        health: 'GET /health'
+      },
+      activeConnections: activeSessions.size,
+      documentation: 'MCP server using Streamable HTTP transport. First: GET / with Accept: text/event-stream to open connection. Then: POST / with mcp-session-id header for all MCP messages (initialize, tools/list, tools/call).'
+    });
+  }
+});
+
+// POST / - Route all POST requests to the StreamableHTTP transport
+// If no transport exists and this is an initialize, create one (ThoughtSpot POSTs before GET)
+app.post('/', express.json(), async (req, res) => {
+  log('info', 'POST / received', {
+    contentType: req.get('content-type'),
+    userAgent: req.get('user-agent'),
+    method: req.body?.method,
+    hasSessionId: !!req.headers['mcp-session-id']
+  });
+
+  try {
+    const sessionId = req.headers['mcp-session-id'] as string;
+
+    // Case 1: Existing session - route to its transport
+    if (sessionId && activeSessions.has(sessionId)) {
+      const session = activeSessions.get(sessionId)!;
+      log('info', 'Routing POST / to existing session', { sessionId, method: req.body?.method });
+      await session.transport.handleRequest(req, res);
+      return;
+    }
+
+    // Case 2: No session ID but this is an initialize request - create new session
+    if (!sessionId && req.body?.method === 'initialize') {
+      log('info', 'Creating new MCP Server and transport for POST / initialize');
+
+      // Create a fresh Server instance for this connection
+      const mcpServer = createMCPServer();
+
+      // Generate session ID upfront
+      const newSessionId = randomUUID();
+
+      log('info', 'Generated session ID', { sessionId: newSessionId });
+
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => newSessionId, // Return our pre-generated ID
+        onsessioninitialized: (sid) => {
+          log('info', 'Session initialized from POST /', { sessionId: sid });
+        }
+      });
+
+      // Store the session immediately (before handleRequest)
+      activeSessions.set(newSessionId, { server: mcpServer, transport });
+      pendingSession = { server: mcpServer, transport, sessionId: newSessionId };
+
+      log('info', 'Connecting Server instance to transport');
+      await mcpServer.connect(transport);
+
+      log('info', 'Handling initialize request', { sessionId: newSessionId });
+      await transport.handleRequest(req, res);
+
+      log('info', 'POST / initialize complete - session ready for GET stream', {
+        sessionId: newSessionId,
+        hasPendingSession: !!pendingSession
+      });
+      return;
+    }
+
+    // Case 3: No valid session
+    log('warn', 'No active session for POST /', {
+      sessionId,
+      method: req.body?.method,
+      availableSessions: Array.from(activeSessions.keys())
+    });
+
+    res.status(400).json({
+      error: 'No active transport session',
+      message: 'Session not found. Please check mcp-session-id header.',
+      sessionId
+    });
+
+  } catch (error) {
+    log('error', 'Error handling POST /', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      method: req.body?.method
+    });
+
+    res.status(500).json({
+      error: 'Failed to process POST request',
+      details: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+// POST /message - Streamable HTTP transport uses this endpoint for client-to-server messages
+// The StreamableHTTPServerTransport handles routing these to the MCP server automatically
+app.post('/message', express.json(), async (req, res) => {
+  log('info', 'POST /message received (Streamable HTTP client message)', {
+    body: req.body,
+    contentType: req.get('content-type'),
+    bodySize: JSON.stringify(req.body).length
+  });
+
+  try {
+    // Find the appropriate transport session and let it handle the message
+    // The transport will route to the appropriate MCP server handler
+    const sessionId = req.headers['mcp-session-id'] as string;
+
+    if (sessionId && activeSessions.has(sessionId)) {
+      const session = activeSessions.get(sessionId)!;
+      await session.transport.handleRequest(req, res);
+      log('info', 'Message routed to Streamable HTTP transport', { sessionId });
+    } else {
+      log('warn', 'No active transport session found', { sessionId });
+      res.status(400).json({
+        error: 'No active transport session',
+        message: 'Please establish a connection first via GET / with Accept: text/event-stream'
+      });
+    }
+  } catch (error) {
+    log('error', 'Error handling /message POST', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    });
+
+    res.status(500).json({
+      error: 'Failed to process message',
+      details: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+// 404 handler
+app.use((req, res) => {
+  log('warn', '404 - Route not found', {
+    method: req.method,
+    path: req.path
+  });
+
+  res.status(404).json({
+    error: 'Not Found',
+    path: req.path,
+    availableEndpoints: ['/', '/health', '/sse', '/messages']
+  });
+});
+
+// Error handler
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  log('error', 'Express error handler triggered', {
+    error: err.message,
+    stack: err.stack,
+    path: req.path
+  });
+
+  res.status(500).json({
+    error: 'Internal Server Error',
+    message: err.message
+  });
+});
+
+// Start server
+async function startServer() {
+  try {
+    log('info', 'Starting Airbnb MCP Server');
+
+    // Initialize robots.txt on startup
+    await fetchRobotsTxt();
+
+    app.listen(PORT, () => {
+      log('info', 'Airbnb MCP Server running successfully', {
+        version: VERSION,
+        port: PORT,
+        robotsRespected: !IGNORE_ROBOTS_TXT,
+        endpoints: {
+          root: `http://localhost:${PORT}/`,
+          sse: `http://localhost:${PORT}/sse`,
+          messages: `http://localhost:${PORT}/messages`,
+          health: `http://localhost:${PORT}/health`
+        },
+        environment: {
+          nodeVersion: process.version,
+          platform: process.platform
+        }
+      });
+    });
+
+    // Graceful shutdown
+    process.on('SIGINT', () => {
+      log('info', 'Received SIGINT, shutting down gracefully');
+      activeSessions.clear();
+      process.exit(0);
+    });
+
+    process.on('SIGTERM', () => {
+      log('info', 'Received SIGTERM, shutting down gracefully');
+      activeSessions.clear();
+      process.exit(0);
+    });
+
+  } catch (error) {
+    log('error', 'Failed to start server', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    });
+    process.exit(1);
+  }
+}
+
+startServer().catch((error) => {
+  log('error', 'Fatal error running server', {
+    error: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined
+  });
+  process.exit(1);
+});
