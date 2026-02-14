@@ -5,6 +5,13 @@
  * Following the official MCP SDK pattern for Express + StreamableHTTP
  */
 
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err);
+});
+
 import express from 'express';
 import { randomUUID } from 'crypto';
 import { Readable } from 'stream';
@@ -293,9 +300,13 @@ app.all('/mcp', async (req, res) => {
 
   try {
     await transport.handleRequest(req, res);
+    log('info', 'Request handled successfully', { statusCode: res.statusCode });
   } catch (error) {
+    console.error('FULL TRANSPORT ERROR:', error);
     log('error', 'Transport error', {
       error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      name: error instanceof Error ? error.name : undefined
     });
     if (!res.headersSent) {
       res.status(500).json({
