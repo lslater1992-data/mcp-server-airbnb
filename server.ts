@@ -256,6 +256,9 @@ function registerHandlers(mcpServer: Server) {
   });
 }
 
+// Store active sessions
+const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: Server }>();
+
 // Create Express app
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -265,30 +268,68 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', version: VERSION });
 });
 
-// Route ALL requests (POST for messages, GET for SSE) to the transport
+// Route ALL requests to the transport
 app.all('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
   log('info', 'Request received on /mcp', {
     method: req.method,
     path: req.path,
     contentType: req.get('content-type'),
-    accept: req.get('accept')
+    accept: req.get('accept'),
+    sessionId: sessionId || 'none'
   });
 
   try {
-    const server = new Server(
-      { name: "airbnb", version: VERSION },
-      { capabilities: { tools: {} } }
-    );
-    registerHandlers(server);
+    // If we have a session ID, use the existing session
+    if (sessionId && sessions.has(sessionId)) {
+      const session = sessions.get(sessionId)!;
+      await session.transport.handleRequest(req, res);
+      log('info', 'Request handled by existing session', { sessionId, statusCode: res.statusCode });
+      return;
+    }
 
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: false,
-    });
+    // If it's a POST without a session ID, create a new session (initialize)
+    if (req.method === 'POST' && !sessionId) {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        enableJsonResponse: false,
+      });
 
-    await server.connect(transport);
-    await transport.handleRequest(req, res);
-    log('info', 'Request handled successfully', { statusCode: res.statusCode });
+      const mcpServer = new Server(
+        { name: "airbnb", version: VERSION },
+        { capabilities: { tools: {} } }
+      );
+      registerHandlers(mcpServer);
+
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) {
+          sessions.delete(sid);
+          log('info', 'Session closed and cleaned up', { sessionId: sid });
+        }
+      };
+
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res);
+
+      if (transport.sessionId) {
+        sessions.set(transport.sessionId, { transport, server: mcpServer });
+        log('info', 'New session created', { sessionId: transport.sessionId });
+      }
+      return;
+    }
+
+    // GET without session or unknown session
+    if (req.method === 'GET') {
+      log('warn', 'GET request without valid session', { sessionId });
+      res.status(400).json({ error: 'No valid session. Send initialize POST first.' });
+      return;
+    }
+
+    // POST with unknown session ID
+    log('warn', 'Request with unknown session ID', { sessionId });
+    res.status(400).json({ error: 'Unknown session ID. Send initialize POST first.' });
   } catch (error) {
     console.error('FULL TRANSPORT ERROR:', error);
     log('error', 'Transport error', {
