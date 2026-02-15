@@ -227,6 +227,10 @@ app.post('/mcp', async (req, res) => {
 
   console.log(`[${new Date().toISOString()}] POST /mcp - method: ${method}, sessionId: ${sessionId || 'none'}`);
 
+  req.on('close', () => {
+    console.log(`[${new Date().toISOString()}] POST connection closed by client, method: ${method}`);
+  });
+
   // Handle notifications/initialized directly - it's just an acknowledgment
   if (method === 'notifications/initialized') {
     console.log(`[${new Date().toISOString()}] Acknowledged notifications/initialized`);
@@ -290,16 +294,18 @@ app.post('/mcp', async (req, res) => {
 // GET /mcp - open SSE stream for server-to-client messages
 app.get('/mcp', async (req, res) => {
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  console.log(`[${new Date().toISOString()}] GET /mcp - sessionId: ${sessionId || 'none'}`);
+  console.log(`[${new Date().toISOString()}] GET /mcp - opening SSE, sessionId: ${sessionId || 'none'}`);
 
   if (sessionId && sessions.has(sessionId)) {
-    console.log(`[${new Date().toISOString()}] Opening SSE stream for session: ${sessionId}`);
     const session = sessions.get(sessionId)!;
+    req.on('close', () => {
+      console.log(`[${new Date().toISOString()}] GET SSE stream closed by client, sessionId: ${sessionId}`);
+    });
     await session.transport.handleRequest(req, res);
     return;
   }
 
-  console.log(`[${new Date().toISOString()}] No valid session for GET`);
+  console.log(`[${new Date().toISOString()}] GET rejected - no valid session`);
   res.status(400).json({ error: 'No valid session' });
 });
 
