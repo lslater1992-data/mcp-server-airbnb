@@ -220,42 +220,24 @@ app.get('/health', (req, res) => {
 // POST /mcp - handle ALL MCP requests statelessly
 app.post('/mcp', async (req, res) => {
   const method = req.body?.method || 'unknown';
-  const sessionId = req.headers['mcp-session-id'] || 'none';
-  console.log(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    level: 'INFO',
-    event: 'POST /mcp',
-    method: method,
-    sessionId: sessionId,
-    accept: req.headers['accept'],
-    contentType: req.headers['content-type'],
-  }));
+  const incomingSessionId = req.headers['mcp-session-id'] as string | undefined;
+
+  console.log(`[${new Date().toISOString()}] POST /mcp - method: ${method}, sessionId: ${incomingSessionId || 'none'}`);
 
   try {
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
+      sessionIdGenerator: incomingSessionId
+        ? () => incomingSessionId    // reuse the client's session ID
+        : () => randomUUID(),         // new session for initialize
       enableJsonResponse: true,
     });
     const server = createServer();
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
     await server.close();
-    console.log(JSON.stringify({
-      timestamp: new Date().toISOString(),
-      level: 'INFO',
-      event: 'Request handled',
-      method: method,
-      statusCode: res.statusCode,
-    }));
-  } catch (error) {
-    console.error(JSON.stringify({
-      timestamp: new Date().toISOString(),
-      level: 'ERROR',
-      event: 'Request failed',
-      method: method,
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-    }));
+    console.log(`[${new Date().toISOString()}] Response sent - method: ${method}, status: ${res.statusCode}`);
+  } catch (error: any) {
+    console.error(`[${new Date().toISOString()}] ERROR - method: ${method}, error: ${error.message}`);
     if (!res.headersSent) {
       res.status(500).json({ error: 'Internal server error' });
     }
@@ -264,12 +246,8 @@ app.post('/mcp', async (req, res) => {
 
 // GET /mcp - return SSE headers for ThoughtSpot compatibility
 app.get('/mcp', (req, res) => {
-  console.log(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    level: 'INFO',
-    event: 'GET /mcp',
-    sessionId: req.headers['mcp-session-id'] || 'none',
-  }));
+  const sessionId = req.headers['mcp-session-id'] || 'none';
+  console.log(`[${new Date().toISOString()}] GET /mcp - sessionId: ${sessionId}`);
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -278,12 +256,8 @@ app.get('/mcp', (req, res) => {
 
 // DELETE /mcp - not needed in stateless mode
 app.delete('/mcp', (req, res) => {
-  console.log(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    level: 'INFO',
-    event: 'DELETE /mcp',
-    sessionId: req.headers['mcp-session-id'] || 'none',
-  }));
+  const sessionId = req.headers['mcp-session-id'] || 'none';
+  console.log(`[${new Date().toISOString()}] DELETE /mcp - sessionId: ${sessionId}`);
   res.status(200).end();
 });
 
@@ -292,9 +266,8 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, async () => {
-  log('info', 'Starting Airbnb MCP Server (stateless mode)');
   if (!IGNORE_ROBOTS_TXT) await fetchRobotsTxt();
-  log('info', 'Airbnb MCP Server running', { version: VERSION, port: PORT, mode: 'stateless' });
+  console.log(`[${new Date().toISOString()}] Airbnb MCP Server running on port ${PORT} (stateless mode, v${VERSION})`);
 });
 
 process.on('SIGINT', () => process.exit(0));
