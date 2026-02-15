@@ -224,6 +224,13 @@ app.post('/mcp', async (req, res) => {
 
   console.log(`[${new Date().toISOString()}] POST /mcp - method: ${method}, sessionId: ${incomingSessionId || 'none'}`);
 
+  // Handle notifications/initialized directly - it's just an acknowledgment
+  if (method === 'notifications/initialized') {
+    console.log(`[${new Date().toISOString()}] Acknowledged notifications/initialized`);
+    res.status(200).end();
+    return;
+  }
+
   try {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: incomingSessionId
