@@ -8,6 +8,7 @@ process.on('unhandledRejection', (err) => {
 });
 
 import express from 'express';
+import { randomUUID } from 'crypto';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
@@ -222,8 +223,8 @@ app.post('/mcp', async (req, res) => {
 
   try {
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,  // stateless - no sessions
-      enableJsonResponse: true,       // return JSON, not SSE
+      sessionIdGenerator: () => randomUUID(),  // return session ID in response
+      enableJsonResponse: true,                // return JSON, not SSE
     });
 
     const server = createServer();
@@ -244,9 +245,12 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-// GET /mcp - not needed in stateless mode
+// GET /mcp - return SSE headers for ThoughtSpot compatibility
 app.get('/mcp', (req, res) => {
-  res.status(405).json({ error: 'SSE not supported in stateless mode' });
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.status(200).end();
 });
 
 // DELETE /mcp - not needed in stateless mode
