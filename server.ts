@@ -8,7 +8,6 @@ process.on('unhandledRejection', (err) => {
 });
 
 import express from 'express';
-import { randomUUID } from 'crypto';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
@@ -18,10 +17,8 @@ import {
   McpError,
   ErrorCode,
 } from "@modelcontextprotocol/sdk/types.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
-import { cleanObject, flattenArraysInObject, pickBySchema } from "./util.js";
 import robotsParser from "robots-parser";
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -183,6 +180,7 @@ async function handleAirbnbListingDetails(args: any) {
   return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }] };
 }
 
+// Create a fresh server instance with tools registered
 function createServer(): Server {
   const server = new Server(
     { name: "airbnb", version: VERSION },
@@ -207,86 +205,53 @@ function createServer(): Server {
   return server;
 }
 
-// ===== Express app following official MCP SDK pattern =====
+// ===== Stateless Express app - new server+transport per request =====
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
-// Store transports by session ID
-const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
-
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', version: VERSION });
 });
 
-// Handle POST requests for client-to-server communication
+// POST /mcp - handle ALL MCP requests statelessly
 app.post('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  let transport: StreamableHTTPServerTransport;
+  log('info', 'POST /mcp', { method: req.body?.method });
 
-  log('info', 'POST /mcp', {
-    sessionId: sessionId || 'none',
-    isInitialize: isInitializeRequest(req.body),
-    method: req.body?.method
-  });
-
-  if (sessionId && transports[sessionId]) {
-    transport = transports[sessionId];
-  } else if (!sessionId && isInitializeRequest(req.body)) {
-    transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (sessionId) => {
-        transports[sessionId] = transport;
-        log('info', 'Session stored', { sessionId });
-      }
+  try {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,  // stateless - no sessions
+      enableJsonResponse: true,       // return JSON, not SSE
     });
-
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        delete transports[transport.sessionId];
-        log('info', 'Session cleaned up', { sessionId: transport.sessionId });
-      }
-    };
 
     const server = createServer();
     await server.connect(transport);
-    log('info', 'New MCP server connected to transport');
-  } else {
-    res.status(400).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
-      id: null,
+    await transport.handleRequest(req, res, req.body);
+    await server.close();
+
+    log('info', 'Request handled successfully');
+  } catch (error) {
+    console.error('Error handling request:', error);
+    log('error', 'Request handling failed', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
     });
-    return;
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal server error' });
+    }
   }
-
-  await transport.handleRequest(req, res, req.body);
 });
 
-// Handle GET requests for server-to-client notifications via SSE
-app.get('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  log('info', 'GET /mcp (SSE)', { sessionId: sessionId || 'none' });
-
-  if (!sessionId || !transports[sessionId]) {
-    res.status(400).send('Invalid or missing session ID');
-    return;
-  }
-  await transports[sessionId].handleRequest(req, res);
+// GET /mcp - not needed in stateless mode
+app.get('/mcp', (req, res) => {
+  res.status(405).json({ error: 'SSE not supported in stateless mode' });
 });
 
-// Handle DELETE requests for session termination
-app.delete('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  log('info', 'DELETE /mcp', { sessionId: sessionId || 'none' });
-
-  if (!sessionId || !transports[sessionId]) {
-    res.status(400).send('Invalid or missing session ID');
-    return;
-  }
-  await transports[sessionId].handleRequest(req, res);
+// DELETE /mcp - not needed in stateless mode
+app.delete('/mcp', (req, res) => {
+  res.status(200).end();
 });
 
 app.use((req, res) => {
@@ -294,9 +259,9 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, async () => {
-  log('info', 'Starting Airbnb MCP Server');
+  log('info', 'Starting Airbnb MCP Server (stateless mode)');
   if (!IGNORE_ROBOTS_TXT) await fetchRobotsTxt();
-  log('info', 'Airbnb MCP Server running', { version: VERSION, port: PORT });
+  log('info', 'Airbnb MCP Server running', { version: VERSION, port: PORT, mode: 'stateless' });
 });
 
 process.on('SIGINT', () => process.exit(0));
