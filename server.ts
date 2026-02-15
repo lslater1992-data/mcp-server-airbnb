@@ -206,23 +206,26 @@ function createServer(): Server {
   return server;
 }
 
-// ===== Stateless Express app - new server+transport per request =====
+// ===== Session-based Express app with SSE transport =====
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
+// Session storage
+const sessions = new Map<string, { transport: StreamableHTTPServerTransport, server: Server }>();
+
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', version: VERSION });
 });
 
-// POST /mcp - handle ALL MCP requests statelessly
+// POST /mcp - handle initialize and subsequent requests
 app.post('/mcp', async (req, res) => {
   const method = req.body?.method || 'unknown';
-  const incomingSessionId = req.headers['mcp-session-id'] as string | undefined;
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
-  console.log(`[${new Date().toISOString()}] POST /mcp - method: ${method}, sessionId: ${incomingSessionId || 'none'}`);
+  console.log(`[${new Date().toISOString()}] POST /mcp - method: ${method}, sessionId: ${sessionId || 'none'}`);
 
   // Handle notifications/initialized directly - it's just an acknowledgment
   if (method === 'notifications/initialized') {
@@ -231,17 +234,50 @@ app.post('/mcp', async (req, res) => {
     return;
   }
 
+  // Existing session
+  if (sessionId && sessions.has(sessionId)) {
+    console.log(`[${new Date().toISOString()}] Using existing session: ${sessionId}`);
+    const session = sessions.get(sessionId)!;
+    await session.transport.handleRequest(req, res, req.body);
+    console.log(`[${new Date().toISOString()}] Response sent - method: ${method}, status: ${res.statusCode}`);
+    return;
+  }
+
+  // New session (initialize)
   try {
+    console.log(`[${new Date().toISOString()}] Creating new session for initialize`);
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: incomingSessionId
-        ? () => incomingSessionId    // reuse the client's session ID
-        : () => randomUUID(),         // new session for initialize
-      enableJsonResponse: true,
+      sessionIdGenerator: () => randomUUID(),
+      enableJsonResponse: false,  // SSE mode for ThoughtSpot
     });
+
     const server = createServer();
+
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid) {
+        console.log(`[${new Date().toISOString()}] Transport closed, removing session: ${sid}`);
+        sessions.delete(sid);
+      }
+    };
+
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
-    await server.close();
+
+    if (transport.sessionId) {
+      console.log(`[${new Date().toISOString()}] Session created: ${transport.sessionId}`);
+      sessions.set(transport.sessionId, { transport, server });
+
+      // Auto-cleanup after 5 minutes
+      setTimeout(() => {
+        if (sessions.has(transport.sessionId!)) {
+          console.log(`[${new Date().toISOString()}] Auto-cleanup session: ${transport.sessionId}`);
+          sessions.delete(transport.sessionId!);
+          server.close();
+        }
+      }, 300000);
+    }
+
     console.log(`[${new Date().toISOString()}] Response sent - method: ${method}, status: ${res.statusCode}`);
   } catch (error: any) {
     console.error(`[${new Date().toISOString()}] ERROR - method: ${method}, error: ${error.message}`);
@@ -251,20 +287,26 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-// GET /mcp - return SSE headers for ThoughtSpot compatibility
-app.get('/mcp', (req, res) => {
-  const sessionId = req.headers['mcp-session-id'] || 'none';
-  console.log(`[${new Date().toISOString()}] GET /mcp - sessionId: ${sessionId}`);
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.status(200).end();
+// GET /mcp - open SSE stream for server-to-client messages
+app.get('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  console.log(`[${new Date().toISOString()}] GET /mcp - sessionId: ${sessionId || 'none'}`);
+
+  if (sessionId && sessions.has(sessionId)) {
+    console.log(`[${new Date().toISOString()}] Opening SSE stream for session: ${sessionId}`);
+    const session = sessions.get(sessionId)!;
+    await session.transport.handleRequest(req, res);
+    return;
+  }
+
+  console.log(`[${new Date().toISOString()}] No valid session for GET`);
+  res.status(400).json({ error: 'No valid session' });
 });
 
-// DELETE /mcp - not needed in stateless mode
+// DELETE /mcp - acknowledge but don't delete session (ThoughtSpot sends this prematurely)
 app.delete('/mcp', (req, res) => {
-  const sessionId = req.headers['mcp-session-id'] || 'none';
-  console.log(`[${new Date().toISOString()}] DELETE /mcp - sessionId: ${sessionId}`);
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  console.log(`[${new Date().toISOString()}] DELETE /mcp - ignored, sessionId: ${sessionId || 'none'}`);
   res.status(200).end();
 });
 
@@ -274,7 +316,7 @@ app.use((req, res) => {
 
 app.listen(PORT, async () => {
   if (!IGNORE_ROBOTS_TXT) await fetchRobotsTxt();
-  console.log(`[${new Date().toISOString()}] Airbnb MCP Server running on port ${PORT} (stateless mode, v${VERSION})`);
+  console.log(`[${new Date().toISOString()}] Airbnb MCP Server running on port ${PORT} (SSE mode with sessions, v${VERSION})`);
 });
 
 process.on('SIGINT', () => process.exit(0));
