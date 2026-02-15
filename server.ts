@@ -219,26 +219,43 @@ app.get('/health', (req, res) => {
 
 // POST /mcp - handle ALL MCP requests statelessly
 app.post('/mcp', async (req, res) => {
-  log('info', 'POST /mcp', { method: req.body?.method });
+  const method = req.body?.method || 'unknown';
+  const sessionId = req.headers['mcp-session-id'] || 'none';
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level: 'INFO',
+    event: 'POST /mcp',
+    method: method,
+    sessionId: sessionId,
+    accept: req.headers['accept'],
+    contentType: req.headers['content-type'],
+  }));
 
   try {
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),  // return session ID in response
-      enableJsonResponse: true,                // return JSON, not SSE
+      sessionIdGenerator: () => randomUUID(),
+      enableJsonResponse: true,
     });
-
     const server = createServer();
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
     await server.close();
-
-    log('info', 'Request handled successfully');
+    console.log(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: 'INFO',
+      event: 'Request handled',
+      method: method,
+      statusCode: res.statusCode,
+    }));
   } catch (error) {
-    console.error('Error handling request:', error);
-    log('error', 'Request handling failed', {
+    console.error(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: 'ERROR',
+      event: 'Request failed',
+      method: method,
       error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined
-    });
+      stack: error instanceof Error ? error.stack : undefined,
+    }));
     if (!res.headersSent) {
       res.status(500).json({ error: 'Internal server error' });
     }
@@ -247,6 +264,12 @@ app.post('/mcp', async (req, res) => {
 
 // GET /mcp - return SSE headers for ThoughtSpot compatibility
 app.get('/mcp', (req, res) => {
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level: 'INFO',
+    event: 'GET /mcp',
+    sessionId: req.headers['mcp-session-id'] || 'none',
+  }));
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -255,6 +278,12 @@ app.get('/mcp', (req, res) => {
 
 // DELETE /mcp - not needed in stateless mode
 app.delete('/mcp', (req, res) => {
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level: 'INFO',
+    event: 'DELETE /mcp',
+    sessionId: req.headers['mcp-session-id'] || 'none',
+  }));
   res.status(200).end();
 });
 
