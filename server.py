@@ -54,6 +54,14 @@ async def ensure_robots():
 
 base_app = FastAPI(title="Airbnb MCP Server")
 
+base_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS", "DELETE"],
+    allow_headers=["*", "MCP-Protocol-Version", "mcp-session-id", "Authorization"],
+)
+
 
 @base_app.get("/health")
 async def health():
@@ -185,21 +193,29 @@ mcp = FastMCP.from_fastapi(app=base_app, name="Airbnb MCP Server")
 mcp_app = mcp.http_app(path="/mcp")
 
 
-app = FastAPI(
+inner_app = FastAPI(
     routes=[*mcp_app.routes, *base_app.routes],
     lifespan=mcp_app.lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*", "MCP-Protocol-Version", "mcp-session-id", "Authorization"],
-)
+
+async def app(scope, receive, send):
+    # Intercept DELETE to prevent session termination
+    if scope["type"] == "http" and scope.get("method") == "DELETE" and scope.get("path") == "/mcp":
+        headers = dict(
+            (k.decode() if isinstance(k, bytes) else k, v.decode() if isinstance(v, bytes) else v)
+            for k, v in scope.get("headers", [])
+        )
+        session_id = headers.get("mcp-session-id", "none")
+        logger.info(f"DELETE /mcp intercepted - keeping session alive, sessionId: {session_id}")
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"0")]})
+        await send({"type": "http.response.body", "body": b""})
+        return
+    await inner_app(scope, receive, send)
+
 
 if __name__ == "__main__":
     import uvicorn
 
     logger.info(f"Airbnb MCP Server starting on port {PORT} (FastMCP mode, v{VERSION})")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run("server:app", host="0.0.0.0", port=PORT)
