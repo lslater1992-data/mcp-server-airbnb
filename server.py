@@ -7,6 +7,7 @@ from typing import Optional
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import FastMCP
 
 VERSION = "0.2.0"
@@ -187,6 +188,14 @@ mcp_app = mcp.http_app(path="/mcp")
 app = FastAPI(
     routes=[*mcp_app.routes, *base_app.routes],
     lifespan=mcp_app.lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*", "MCP-Protocol-Version", "mcp-session-id", "Authorization"],
 )
 
 if __name__ == "__main__":
