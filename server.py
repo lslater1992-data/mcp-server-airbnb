@@ -1,4 +1,7 @@
 import os
+
+os.environ["FASTMCP_EXPERIMENTAL_ENABLE_NEW_OPENAPI_PARSER"] = "true"
+
 import logging
 from urllib.parse import urlencode
 from urllib.robotparser import RobotFileParser
@@ -72,8 +75,8 @@ async def health():
     return {"status": "healthy", "version": VERSION}
 
 
-@base_app.post("/airbnb/search")
-async def airbnb_search(
+@base_app.post("/search")
+async def search_listings(
     location: str,
     checkin: Optional[str] = None,
     checkout: Optional[str] = None,
@@ -140,8 +143,8 @@ async def airbnb_search(
     return {"listings": listings, "search_params": {"location": location}}
 
 
-@base_app.post("/airbnb/listing")
-async def airbnb_listing_details(listing_id: str):
+@base_app.post("/listing")
+async def get_listing(listing_id: str):
     """Get detailed information about a specific Airbnb listing"""
     await ensure_robots()
 
