@@ -9,8 +9,6 @@ import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastmcp import FastMCP
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
 
 VERSION = "0.2.0"
 IGNORE_ROBOTS_TXT = os.environ.get("IGNORE_ROBOTS_TXT", "false").lower() == "true"
@@ -187,24 +185,30 @@ mcp = FastMCP.from_fastapi(app=base_app, name="Airbnb MCP Server")
 mcp_app = mcp.http_app(path="/mcp")
 
 
-class IgnoreDeleteMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        if request.method == "DELETE" and request.url.path == "/mcp":
-            session_id = request.headers.get("mcp-session-id", "none")
-            logger.info(f"DELETE /mcp intercepted and ignored - keeping session alive, sessionId: {session_id}")
-            return Response(status_code=200)
-        return await call_next(request)
-
-
-app = FastAPI(
+# Create the combined app
+inner_app = FastAPI(
     routes=[*mcp_app.routes, *base_app.routes],
     lifespan=mcp_app.lifespan,
 )
 
-app.add_middleware(IgnoreDeleteMiddleware)
+
+# Raw ASGI middleware to intercept DELETE /mcp without breaking SSE
+async def delete_interceptor(scope, receive, send):
+    if scope["type"] == "http" and scope["method"] == "DELETE" and scope["path"] == "/mcp":
+        headers = dict((k.decode(), v.decode()) for k, v in scope.get("headers", []))
+        session_id = headers.get("mcp-session-id", "none")
+        logger.info(f"DELETE /mcp intercepted - keeping session alive, sessionId: {session_id}")
+
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+        return
+    await inner_app(scope, receive, send)
+
+
+app = delete_interceptor
 
 if __name__ == "__main__":
     import uvicorn
 
     logger.info(f"Airbnb MCP Server starting on port {PORT} (FastMCP mode, v{VERSION})")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run("server:app", host="0.0.0.0", port=PORT)
