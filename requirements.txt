@@ -1,0 +1,5 @@
+fastmcp
+fastapi
+uvicorn[standard]
+beautifulsoup4
+httpx

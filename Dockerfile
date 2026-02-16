@@ -1,23 +1,20 @@
-# Airbnb MCP Server - HTTP/SSE Transport for Railway
-FROM node:lts-alpine
+# Airbnb MCP Server - Python FastMCP for Railway
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Copy package files and install dependencies
-COPY package*.json ./
-RUN npm install --ignore-scripts
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy rest of the source code
-COPY . .
+# Copy source
+COPY server.py .
 
-# Build the project explicitly
-RUN npm run build
-
-# Expose port for HTTP/SSE server
+# Expose port for HTTP server
 EXPOSE 8080
 
 # Set environment variable for PORT (Railway will override this)
 ENV PORT=8080
 
-# Run the HTTP server instead of stdio
-CMD [ "node", "dist/server.js" ]
+# Run the server
+CMD ["python", "server.py"]
