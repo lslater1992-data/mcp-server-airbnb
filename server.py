@@ -9,8 +9,6 @@ import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastmcp import FastMCP
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
 
 VERSION = "0.2.0"
 IGNORE_ROBOTS_TXT = os.environ.get("IGNORE_ROBOTS_TXT", "false").lower() == "true"
@@ -181,25 +179,15 @@ async def airbnb_listing_details(listing_id: str):
     return details
 
 
-# ===== FastMCP integration =====
+# ===== FastMCP integration — let FastMCP handle all session management =====
 
 mcp = FastMCP.from_fastapi(app=base_app, name="Airbnb MCP Server")
 mcp_app = mcp.http_app(path="/mcp")
-
-class IgnoreDeleteMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        if request.method == "DELETE" and request.url.path == "/mcp":
-            session_id = request.headers.get("mcp-session-id", "none")
-            logger.info(f"DELETE /mcp ignored - keeping session alive, sessionId: {session_id}")
-            return Response(status_code=200)
-        return await call_next(request)
 
 app = FastAPI(
     routes=[*mcp_app.routes, *base_app.routes],
     lifespan=mcp_app.lifespan,
 )
-
-app.add_middleware(IgnoreDeleteMiddleware)
 
 if __name__ == "__main__":
     import uvicorn
