@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 from urllib.parse import urlencode
 from urllib.robotparser import RobotFileParser
@@ -185,30 +184,13 @@ mcp = FastMCP.from_fastapi(app=base_app, name="Airbnb MCP Server")
 mcp_app = mcp.http_app(path="/mcp")
 
 
-# Create the combined app
-inner_app = FastAPI(
+app = FastAPI(
     routes=[*mcp_app.routes, *base_app.routes],
     lifespan=mcp_app.lifespan,
 )
-
-
-# Raw ASGI middleware to intercept DELETE /mcp without breaking SSE
-async def delete_interceptor(scope, receive, send):
-    if scope["type"] == "http" and scope["method"] == "DELETE" and scope["path"] == "/mcp":
-        headers = dict((k.decode(), v.decode()) for k, v in scope.get("headers", []))
-        session_id = headers.get("mcp-session-id", "none")
-        logger.info(f"DELETE /mcp intercepted - keeping session alive, sessionId: {session_id}")
-
-        await send({"type": "http.response.start", "status": 200, "headers": []})
-        await send({"type": "http.response.body", "body": b""})
-        return
-    await inner_app(scope, receive, send)
-
-
-app = delete_interceptor
 
 if __name__ == "__main__":
     import uvicorn
 
     logger.info(f"Airbnb MCP Server starting on port {PORT} (FastMCP mode, v{VERSION})")
-    uvicorn.run("server:app", host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
