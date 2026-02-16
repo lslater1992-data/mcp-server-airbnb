@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import FastMCP
+from starlette.responses import JSONResponse as StarletteJSONResponse
 
 VERSION = "0.2.0"
 IGNORE_ROBOTS_TXT = os.environ.get("IGNORE_ROBOTS_TXT", "false").lower() == "true"
@@ -194,14 +195,35 @@ async def airbnb_listing_details(listing_id: str):
 mcp = FastMCP.from_fastapi(app=base_app, name="Airbnb MCP Server")
 mcp_app = mcp.http_app(path="/mcp")
 
-
-app = FastAPI(
+inner_app = FastAPI(
     routes=[*mcp_app.routes, *base_app.routes],
     lifespan=mcp_app.lifespan,
 )
+
+# Add Bearer auth to inner_app
+if AUTH_ENABLED and BEARER_TOKEN:
+    @inner_app.middleware("http")
+    async def auth_middleware(request, call_next):
+        if request.url.path == "/health":
+            return await call_next(request)
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.startswith("Bearer ") or auth_header[7:] != BEARER_TOKEN:
+            return StarletteJSONResponse(status_code=401, content={"error": "Unauthorized"})
+        return await call_next(request)
+
+
+# ASGI wrapper to intercept DELETE
+async def app(scope, receive, send):
+    if scope["type"] == "http" and scope.get("method") == "DELETE" and scope.get("path") == "/mcp":
+        logger.info("DELETE /mcp intercepted - session preserved")
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"0")]})
+        await send({"type": "http.response.body", "body": b""})
+        return
+    await inner_app(scope, receive, send)
+
 
 if __name__ == "__main__":
     import uvicorn
 
     logger.info(f"Airbnb MCP Server starting on port {PORT} (FastMCP mode, v{VERSION})")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run("server:app", host="0.0.0.0", port=PORT)
