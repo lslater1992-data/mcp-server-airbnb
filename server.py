@@ -126,9 +126,10 @@ def extract_price_from_result(result: dict) -> Optional[str]:
 
 def parse_listings_from_json(html: str) -> List[dict]:
     """Extract listings from embedded JSON in Airbnb's HTML."""
-    soup = BeautifulSoup(html, "html.parser")
+    data = None
 
-    # Strategy 1: <script id="data-deferred-state-0" type="application/json">
+    # Strategy 1: BeautifulSoup — <script id="data-deferred-state-0">
+    soup = BeautifulSoup(html, "html.parser")
     script = soup.find("script", {"id": "data-deferred-state-0"})
     if not script:
         # Strategy 2: Any script tag with "searchResults" or "staysSearch"
@@ -138,14 +139,31 @@ def parse_listings_from_json(html: str) -> List[dict]:
                 script = s
                 break
 
-    if not script or not script.string:
-        logger.warning("No embedded JSON data found in HTML")
-        return []
+    if script and script.string:
+        try:
+            data = json.loads(script.string)
+            logger.info(f"Parsed JSON from BeautifulSoup script tag: {len(script.string)} chars")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse BeautifulSoup-found JSON: {e}")
 
-    try:
-        data = json.loads(script.string)
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse embedded JSON: {e}")
+    # Strategy 3: Regex fallback if BeautifulSoup missed it
+    if data is None:
+        script_match = re.search(r'<script[^>]*id="data-deferred-state-0"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if script_match:
+            logger.info(f"Regex found deferred state JSON: {len(script_match.group(1))} chars (BeautifulSoup missed it)")
+            try:
+                data = json.loads(script_match.group(1))
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse regex-extracted JSON: {e}")
+
+    # Strategy 4: Debug logging if nothing found
+    if data is None:
+        if "staysSearch" in html:
+            logger.info(f"Found staysSearch in HTML ({len(html)} total chars) but could not extract script tag")
+        elif "searchResults" in html:
+            logger.info(f"Found searchResults in HTML ({len(html)} total chars) but could not extract script tag")
+        else:
+            logger.warning(f"No listing data found anywhere in HTML ({len(html)} total chars)")
         return []
 
     # Navigate to search results — try multiple known paths
