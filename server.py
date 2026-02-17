@@ -170,21 +170,40 @@ def parse_listings_from_json(html: str) -> List[dict]:
     if isinstance(data, dict):
         logger.info(f"Top-level keys: {list(data.keys())[:10]}")
 
-    # Explore niobeClientData (not niobeMinimalClientData)
+    # Drill into niobeClientData to find searchResults path
     for niobe_key in ["niobeClientData", "niobeMinimalClientData"]:
         niobe = data.get(niobe_key, []) if isinstance(data, dict) else []
-        if niobe:
-            logger.info(f"{niobe_key} has {len(niobe)} entries")
-            for i, entry in enumerate(niobe[:5]):
-                if isinstance(entry, list) and len(entry) >= 2:
-                    key = str(entry[0])[:100]
-                    val = entry[1]
-                    if isinstance(val, dict):
-                        logger.info(f"  Entry {i}: key='{key}', value keys={list(val.keys())[:10]}")
-                    else:
-                        logger.info(f"  Entry {i}: key='{key}', value type={type(val).__name__}")
-                else:
-                    logger.info(f"  Entry {i}: type={type(entry).__name__}, len={len(entry) if hasattr(entry, '__len__') else 'N/A'}")
+        if not niobe:
+            continue
+        logger.info(f"{niobe_key} has {len(niobe)} entries")
+        if isinstance(niobe[0], list) and len(niobe[0]) >= 2:
+            entry_data = niobe[0][1]
+            if isinstance(entry_data, dict):
+                logger.info(f"  entry[0][1] keys: {list(entry_data.keys())[:10]}")
+                if "data" in entry_data:
+                    data_level = entry_data["data"]
+                    logger.info(f"  ['data'] keys: {list(data_level.keys())[:10]}")
+                    if "presentation" in data_level:
+                        pres = data_level["presentation"]
+                        logger.info(f"  ['data']['presentation'] keys: {list(pres.keys())[:10]}")
+                        if "staysSearch" in pres:
+                            stays = pres["staysSearch"]
+                            logger.info(f"  ['data']['presentation']['staysSearch'] keys: {list(stays.keys())[:10]}")
+                            if "results" in stays:
+                                results = stays["results"]
+                                logger.info(f"  ['data']['presentation']['staysSearch']['results'] keys: {list(results.keys())[:10]}")
+                                if "searchResults" in results:
+                                    sr = results["searchResults"]
+                                    logger.info(f"  searchResults: type={type(sr).__name__}, len={len(sr) if isinstance(sr, list) else 'N/A'}")
+                                    if isinstance(sr, list) and sr:
+                                        logger.info(f"  First result keys: {list(sr[0].keys())[:15] if isinstance(sr[0], dict) else type(sr[0]).__name__}")
+                                        logger.info(f"  First result preview: {json.dumps(sr[0], default=str)[:500]}")
+                        elif "explore" in pres:
+                            explore = pres["explore"]
+                            logger.info(f"  ['data']['presentation']['explore'] keys: {list(explore.keys())[:10]}")
+                            if "sections" in explore:
+                                sections = explore["sections"]
+                                logger.info(f"  ['data']['presentation']['explore']['sections'] keys: {list(sections.keys())[:10]}")
 
     # Navigate to search results — try multiple known paths
     search_results = None
