@@ -1,9 +1,10 @@
 import os
 import re
+import json
 import logging
 from urllib.parse import urlencode, quote
 from urllib.robotparser import RobotFileParser
-from typing import Optional, List
+from typing import Optional, List, Any
 
 import httpx
 from bs4 import BeautifulSoup
@@ -23,7 +24,7 @@ SCRAPEOPS_API_KEY = os.environ.get("SCRAPEOPS_API_KEY")
 def get_scrapeops_url(target_url: str) -> str:
     """Route through ScrapeOps proxy if API key is configured."""
     if SCRAPEOPS_API_KEY:
-        return f"https://proxy.scrapeops.io/v1/?api_key={SCRAPEOPS_API_KEY}&url={quote(target_url)}&render_js=1&residential=1"
+        return f"https://proxy.scrapeops.io/v1/?api_key={SCRAPEOPS_API_KEY}&url={quote(target_url)}&render_js=0&residential=1"
     return target_url
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -82,62 +83,119 @@ async def health():
     return {"status": "healthy", "version": VERSION}
 
 
-PRICE_PATTERN = re.compile(r'[$€£¥₹]\s*[\d,]+(?:\.\d{2})?|[\d,]+(?:\.\d{2})?\s*[$€£¥₹]')
-
-
-def extract_price(element) -> Optional[str]:
-    """Extract price from a listing card using multiple strategies."""
-    # Strategy 1: data-testid selector (may work on some versions)
-    price_el = element.select_one('[data-testid="listing-card-price"]')
-    if price_el:
-        text = price_el.get_text(strip=True)
-        if text:
-            return text
-
-    # Strategy 2: Look for "per night" or "night" text in spans
-    for span in element.find_all("span"):
-        text = span.get_text(strip=True)
-        if "night" in text.lower() and PRICE_PATTERN.search(text):
-            return text
-
-    # Strategy 3: Find any element with a currency symbol
-    for span in element.find_all(["span", "div"]):
-        text = span.get_text(strip=True)
-        match = PRICE_PATTERN.search(text)
-        if match and len(text) < 50:  # Avoid grabbing large text blocks
-            return text
-
-    # Strategy 4: Check listing-card-subtitle elements for price info
-    for sub in element.select('[data-testid="listing-card-subtitle"]'):
-        text = sub.get_text(strip=True)
-        if PRICE_PATTERN.search(text):
-            return text
-
+def deep_find(obj: Any, key: str) -> Any:
+    """Recursively search a nested dict/list for a key."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            result = deep_find(v, key)
+            if result is not None:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = deep_find(item, key)
+            if result is not None:
+                return result
     return None
 
 
-def parse_listings(soup) -> List[dict]:
-    """Parse listing cards from a BeautifulSoup page."""
+def extract_price_from_result(result: dict) -> Optional[str]:
+    """Extract price string from a search result JSON object."""
+    # Try pricingQuote.structuredStayDisplayPrice
+    pricing = deep_find(result, "pricingQuote")
+    if pricing:
+        display_price = deep_find(pricing, "structuredStayDisplayPrice")
+        if display_price:
+            primary = deep_find(display_price, "primaryLine")
+            if primary:
+                price_str = deep_find(primary, "accessibilityLabel") or deep_find(primary, "price")
+                if price_str:
+                    return str(price_str)
+        # Fallback: priceString or price
+        price_str = deep_find(pricing, "priceString") or deep_find(pricing, "price")
+        if price_str:
+            return str(price_str)
+    # Fallback: look for any price-like field
+    for field in ["priceString", "price", "discountedPrice", "originalPrice"]:
+        val = deep_find(result, field)
+        if val:
+            return str(val)
+    return None
+
+
+def parse_listings_from_json(html: str) -> List[dict]:
+    """Extract listings from embedded JSON in Airbnb's HTML."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Strategy 1: <script id="data-deferred-state-0" type="application/json">
+    script = soup.find("script", {"id": "data-deferred-state-0"})
+    if not script:
+        # Strategy 2: Any script tag with "searchResults" or "staysSearch"
+        for s in soup.find_all("script"):
+            text = s.string or ""
+            if "searchResults" in text or "staysSearch" in text:
+                script = s
+                break
+
+    if not script or not script.string:
+        logger.warning("No embedded JSON data found in HTML")
+        return []
+
+    try:
+        data = json.loads(script.string)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse embedded JSON: {e}")
+        return []
+
+    # Navigate to search results — try multiple known paths
+    search_results = None
+    for path_attempt in [
+        lambda d: d["niobeMinimalClientData"][0][1]["data"]["presentation"]["staysSearch"]["results"]["searchResults"],
+        lambda d: d["niobeMinimalClientData"][0][1]["data"]["presentation"]["explore"]["sections"]["sectionIndependentData"]["staysSearch"]["searchResults"],
+        lambda d: deep_find(d, "searchResults"),
+    ]:
+        try:
+            search_results = path_attempt(data)
+            if search_results:
+                break
+        except (KeyError, IndexError, TypeError):
+            continue
+
+    if not search_results:
+        logger.warning("Could not find searchResults in JSON data")
+        logger.warning(f"Top-level keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+        return []
+
     listings = []
-    for element in soup.select('[itemprop="itemListElement"]'):
-        title_el = element.select_one('[data-testid="listing-card-title"]')
-        rating_el = element.select_one('[aria-label*="rating"]')
-        url_el = element.select_one('a[href^="/rooms/"]')
-        img_el = element.select_one("img")
+    for result in search_results:
+        try:
+            listing_data = deep_find(result, "listing") or {}
+            listing_id = listing_data.get("id") or deep_find(result, "listingId")
+            name = listing_data.get("name") or deep_find(result, "listingName")
 
-        title = title_el.get_text(strip=True) if title_el else None
-        url = url_el.get("href") if url_el else None
+            if not listing_id and not name:
+                continue
 
-        if title and url:
-            if not url.startswith("http"):
-                url = f"https://www.airbnb.com{url}"
+            avg_rating = listing_data.get("avgRating") or deep_find(result, "avgRating")
+            coordinate = listing_data.get("coordinate") or {}
+            media = listing_data.get("contextualPictures") or listing_data.get("pictures") or []
+            first_image = media[0].get("picture") if media and isinstance(media[0], dict) else None
+
             listings.append({
-                "title": title,
-                "price": extract_price(element),
-                "rating": rating_el.get("aria-label") if rating_el else None,
-                "url": url,
-                "image": img_el.get("src") if img_el else None,
+                "title": name or "",
+                "listing_id": str(listing_id) if listing_id else None,
+                "price": extract_price_from_result(result),
+                "rating": float(avg_rating) if avg_rating else None,
+                "url": f"https://www.airbnb.com/rooms/{listing_id}" if listing_id else None,
+                "image": first_image,
+                "lat": coordinate.get("latitude"),
+                "lng": coordinate.get("longitude"),
             })
+        except Exception as e:
+            logger.warning(f"Failed to parse listing result: {e}")
+            continue
+
     return listings
 
 
@@ -193,8 +251,7 @@ async def search_listings(
                 logger.warning(f"Page {page + 1} fetch failed: {response.status_code}")
                 break
 
-            soup = BeautifulSoup(response.text, "html.parser")
-            page_listings = parse_listings(soup)
+            page_listings = parse_listings_from_json(response.text)
 
             if not page_listings:
                 logger.warning(f"No listings found on page {page + 1}. HTML preview (first 5000 chars): {response.text[:5000]}")
