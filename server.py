@@ -4,7 +4,7 @@ import json
 import logging
 from urllib.parse import urlencode, quote
 from urllib.robotparser import RobotFileParser
-from typing import Optional, List, Any
+from typing import Optional, List
 
 import httpx
 from bs4 import BeautifulSoup
@@ -83,47 +83,6 @@ async def health():
     return {"status": "healthy", "version": VERSION}
 
 
-def deep_find(obj: Any, key: str) -> Any:
-    """Recursively search a nested dict/list for a key."""
-    if isinstance(obj, dict):
-        if key in obj:
-            return obj[key]
-        for v in obj.values():
-            result = deep_find(v, key)
-            if result is not None:
-                return result
-    elif isinstance(obj, list):
-        for item in obj:
-            result = deep_find(item, key)
-            if result is not None:
-                return result
-    return None
-
-
-def extract_price_from_result(result: dict) -> Optional[str]:
-    """Extract price string from a search result JSON object."""
-    # Try pricingQuote.structuredStayDisplayPrice
-    pricing = deep_find(result, "pricingQuote")
-    if pricing:
-        display_price = deep_find(pricing, "structuredStayDisplayPrice")
-        if display_price:
-            primary = deep_find(display_price, "primaryLine")
-            if primary:
-                price_str = deep_find(primary, "accessibilityLabel") or deep_find(primary, "price")
-                if price_str:
-                    return str(price_str)
-        # Fallback: priceString or price
-        price_str = deep_find(pricing, "priceString") or deep_find(pricing, "price")
-        if price_str:
-            return str(price_str)
-    # Fallback: look for any price-like field
-    for field in ["priceString", "price", "discountedPrice", "originalPrice"]:
-        val = deep_find(result, field)
-        if val:
-            return str(val)
-    return None
-
-
 def parse_listings_from_json(html: str) -> List[dict]:
     """Extract listings from embedded JSON in Airbnb's HTML."""
     data = None
@@ -142,115 +101,68 @@ def parse_listings_from_json(html: str) -> List[dict]:
     if script and script.string:
         try:
             data = json.loads(script.string)
-            logger.info(f"Parsed JSON from BeautifulSoup script tag: {len(script.string)} chars")
+            logger.info(f"Parsed JSON from script tag: {len(script.string)} chars")
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse BeautifulSoup-found JSON: {e}")
+            logger.error(f"Failed to parse JSON: {e}")
 
     # Strategy 3: Regex fallback if BeautifulSoup missed it
     if data is None:
         script_match = re.search(r'<script[^>]*id="data-deferred-state-0"[^>]*>(.*?)</script>', html, re.DOTALL)
         if script_match:
-            logger.info(f"Regex found deferred state JSON: {len(script_match.group(1))} chars (BeautifulSoup missed it)")
             try:
                 data = json.loads(script_match.group(1))
+                logger.info(f"Parsed JSON via regex fallback: {len(script_match.group(1))} chars")
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse regex-extracted JSON: {e}")
 
-    # Strategy 4: Debug logging if nothing found
     if data is None:
-        if "staysSearch" in html:
-            logger.info(f"Found staysSearch in HTML ({len(html)} total chars) but could not extract script tag")
-        elif "searchResults" in html:
-            logger.info(f"Found searchResults in HTML ({len(html)} total chars) but could not extract script tag")
-        else:
-            logger.warning(f"No listing data found anywhere in HTML ({len(html)} total chars)")
+        logger.warning(f"No JSON data found in HTML ({len(html)} total chars)")
         return []
 
-    # Debug: explore the JSON structure
-    if isinstance(data, dict):
-        logger.info(f"Top-level keys: {list(data.keys())[:10]}")
-
-    # Drill into niobeClientData to find searchResults path
+    # Navigate to searchResults via known paths
+    search_results = None
     for niobe_key in ["niobeClientData", "niobeMinimalClientData"]:
         niobe = data.get(niobe_key, []) if isinstance(data, dict) else []
-        if not niobe:
-            continue
-        logger.info(f"{niobe_key} has {len(niobe)} entries")
-        if isinstance(niobe[0], list) and len(niobe[0]) >= 2:
-            entry_data = niobe[0][1]
-            if isinstance(entry_data, dict):
-                logger.info(f"  entry[0][1] keys: {list(entry_data.keys())[:10]}")
-                if "data" in entry_data:
-                    data_level = entry_data["data"]
-                    logger.info(f"  ['data'] keys: {list(data_level.keys())[:10]}")
-                    if "presentation" in data_level:
-                        pres = data_level["presentation"]
-                        logger.info(f"  ['data']['presentation'] keys: {list(pres.keys())[:10]}")
-                        if "staysSearch" in pres:
-                            stays = pres["staysSearch"]
-                            logger.info(f"  ['data']['presentation']['staysSearch'] keys: {list(stays.keys())[:10]}")
-                            if "results" in stays:
-                                results = stays["results"]
-                                logger.info(f"  ['data']['presentation']['staysSearch']['results'] keys: {list(results.keys())[:10]}")
-                                if "searchResults" in results:
-                                    sr = results["searchResults"]
-                                    logger.info(f"  searchResults: type={type(sr).__name__}, len={len(sr) if isinstance(sr, list) else 'N/A'}")
-                                    if isinstance(sr, list) and sr:
-                                        logger.info(f"  First result keys: {list(sr[0].keys())[:15] if isinstance(sr[0], dict) else type(sr[0]).__name__}")
-                                        logger.info(f"  First result preview: {json.dumps(sr[0], default=str)[:500]}")
-                        elif "explore" in pres:
-                            explore = pres["explore"]
-                            logger.info(f"  ['data']['presentation']['explore'] keys: {list(explore.keys())[:10]}")
-                            if "sections" in explore:
-                                sections = explore["sections"]
-                                logger.info(f"  ['data']['presentation']['explore']['sections'] keys: {list(sections.keys())[:10]}")
-
-    # Navigate to search results — try multiple known paths
-    search_results = None
-    for path_attempt in [
-        lambda d: d["niobeMinimalClientData"][0][1]["data"]["presentation"]["staysSearch"]["results"]["searchResults"],
-        lambda d: d["niobeMinimalClientData"][0][1]["data"]["presentation"]["explore"]["sections"]["sectionIndependentData"]["staysSearch"]["searchResults"],
-        lambda d: d["niobeClientData"][0][1]["data"]["presentation"]["staysSearch"]["results"]["searchResults"],
-        lambda d: d["niobeClientData"][0][1]["data"]["presentation"]["explore"]["sections"]["sectionIndependentData"]["staysSearch"]["searchResults"],
-        lambda d: deep_find(d, "searchResults"),
-    ]:
-        try:
-            search_results = path_attempt(data)
+        if niobe and isinstance(niobe[0], list) and len(niobe[0]) >= 2:
+            search_results = (niobe[0][1]
+                .get("data", {})
+                .get("presentation", {})
+                .get("staysSearch", {})
+                .get("results", {})
+                .get("searchResults", []))
             if search_results:
+                logger.info(f"Found {len(search_results)} results via {niobe_key}")
                 break
-        except (KeyError, IndexError, TypeError):
-            continue
 
     if not search_results:
         logger.warning("Could not find searchResults in JSON data")
-        logger.warning(f"Top-level keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
         return []
 
     listings = []
     for result in search_results:
         try:
-            listing_data = deep_find(result, "listing") or {}
-            listing_id = listing_data.get("id") or deep_find(result, "listingId")
-            name = listing_data.get("name") or deep_find(result, "listingName")
+            listing = {
+                "title": result.get("title", ""),
+                "listing_id": result.get("propertyId", ""),
+                "rating": result.get("avgRatingLocalized", ""),
+                "url": f"https://www.airbnb.com/rooms/{result.get('propertyId', '')}",
+                "image": None,
+                "price": None,
+                "subtitle": result.get("subtitle", ""),
+            }
 
-            if not listing_id and not name:
-                continue
+            # Extract price from structuredDisplayPrice
+            price_data = result.get("structuredDisplayPrice", {})
+            if price_data:
+                primary = price_data.get("primaryLine", {})
+                listing["price"] = primary.get("accessibilityLabel") or primary.get("price", "")
 
-            avg_rating = listing_data.get("avgRating") or deep_find(result, "avgRating")
-            coordinate = listing_data.get("coordinate") or {}
-            media = listing_data.get("contextualPictures") or listing_data.get("pictures") or []
-            first_image = media[0].get("picture") if media and isinstance(media[0], dict) else None
+            # Extract first image
+            pics = result.get("contextualPictures", [])
+            if pics:
+                listing["image"] = pics[0].get("picture", "")
 
-            listings.append({
-                "title": name or "",
-                "listing_id": str(listing_id) if listing_id else None,
-                "price": extract_price_from_result(result),
-                "rating": float(avg_rating) if avg_rating else None,
-                "url": f"https://www.airbnb.com/rooms/{listing_id}" if listing_id else None,
-                "image": first_image,
-                "lat": coordinate.get("latitude"),
-                "lng": coordinate.get("longitude"),
-            })
+            listings.append(listing)
         except Exception as e:
             logger.warning(f"Failed to parse listing result: {e}")
             continue
