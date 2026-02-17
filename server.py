@@ -1,8 +1,9 @@
 import os
+import re
 import logging
 from urllib.parse import urlencode
 from urllib.robotparser import RobotFileParser
-from typing import Optional
+from typing import Optional, List
 
 import httpx
 from bs4 import BeautifulSoup
@@ -64,6 +65,65 @@ async def health():
     return {"status": "healthy", "version": VERSION}
 
 
+PRICE_PATTERN = re.compile(r'[$€£¥₹]\s*[\d,]+(?:\.\d{2})?|[\d,]+(?:\.\d{2})?\s*[$€£¥₹]')
+
+
+def extract_price(element) -> Optional[str]:
+    """Extract price from a listing card using multiple strategies."""
+    # Strategy 1: data-testid selector (may work on some versions)
+    price_el = element.select_one('[data-testid="listing-card-price"]')
+    if price_el:
+        text = price_el.get_text(strip=True)
+        if text:
+            return text
+
+    # Strategy 2: Look for "per night" or "night" text in spans
+    for span in element.find_all("span"):
+        text = span.get_text(strip=True)
+        if "night" in text.lower() and PRICE_PATTERN.search(text):
+            return text
+
+    # Strategy 3: Find any element with a currency symbol
+    for span in element.find_all(["span", "div"]):
+        text = span.get_text(strip=True)
+        match = PRICE_PATTERN.search(text)
+        if match and len(text) < 50:  # Avoid grabbing large text blocks
+            return text
+
+    # Strategy 4: Check listing-card-subtitle elements for price info
+    for sub in element.select('[data-testid="listing-card-subtitle"]'):
+        text = sub.get_text(strip=True)
+        if PRICE_PATTERN.search(text):
+            return text
+
+    return None
+
+
+def parse_listings(soup) -> List[dict]:
+    """Parse listing cards from a BeautifulSoup page."""
+    listings = []
+    for element in soup.select('[itemprop="itemListElement"]'):
+        title_el = element.select_one('[data-testid="listing-card-title"]')
+        rating_el = element.select_one('[aria-label*="rating"]')
+        url_el = element.select_one('a[href^="/rooms/"]')
+        img_el = element.select_one("img")
+
+        title = title_el.get_text(strip=True) if title_el else None
+        url = url_el.get("href") if url_el else None
+
+        if title and url:
+            if not url.startswith("http"):
+                url = f"https://www.airbnb.com{url}"
+            listings.append({
+                "title": title,
+                "price": extract_price(element),
+                "rating": rating_el.get("aria-label") if rating_el else None,
+                "url": url,
+                "image": img_el.get("src") if img_el else None,
+            })
+    return listings
+
+
 @base_app.post("/search")
 async def search_listings(
     location: str,
@@ -73,9 +133,15 @@ async def search_listings(
     children: int = 0,
     infants: int = 0,
     pets: int = 0,
+    max_pages: int = 1,
 ):
-    """Search Airbnb listings by location, dates, and filters"""
+    """Search Airbnb listings by location, dates, and filters. Use max_pages to fetch more results (each page has ~18 listings, max 3 pages)."""
     await ensure_robots()
+
+    if max_pages < 1:
+        max_pages = 1
+    if max_pages > 3:
+        max_pages = 3
 
     params = {"query": location}
     if checkin:
@@ -91,45 +157,42 @@ async def search_listings(
     if pets:
         params["pets"] = str(pets)
 
-    search_url = f"https://www.airbnb.com/s/homes?{urlencode(params)}"
-
     if not is_allowed_by_robots("/s/homes"):
         return {"error": "Access not allowed by robots.txt"}
 
-    logger.info(f"Fetching Airbnb search: {search_url}")
+    all_listings = []
 
     async with httpx.AsyncClient() as client:
-        response = await client.get(search_url, headers=HEADERS, follow_redirects=True, timeout=30.0)
+        for page in range(max_pages):
+            page_params = {**params}
+            if page > 0:
+                page_params["items_offset"] = str(page * 18)
 
-    if response.status_code != 200:
-        return {"error": f"Failed to fetch: {response.status_code}"}
+            search_url = f"https://www.airbnb.com/s/homes?{urlencode(page_params)}"
+            logger.info(f"Fetching Airbnb search page {page + 1}: {search_url}")
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    listings = []
+            response = await client.get(search_url, headers=HEADERS, follow_redirects=True, timeout=30.0)
 
-    for element in soup.select('[itemprop="itemListElement"]'):
-        title_el = element.select_one('[data-testid="listing-card-title"]')
-        price_el = element.select_one('[data-testid="listing-card-price"]')
-        rating_el = element.select_one('[aria-label*="rating"]')
-        url_el = element.select_one('a[href^="/rooms/"]')
-        img_el = element.select_one("img")
+            if response.status_code != 200:
+                logger.warning(f"Page {page + 1} fetch failed: {response.status_code}")
+                break
 
-        title = title_el.get_text(strip=True) if title_el else None
-        url = url_el.get("href") if url_el else None
+            soup = BeautifulSoup(response.text, "html.parser")
+            page_listings = parse_listings(soup)
 
-        if title and url:
-            if not url.startswith("http"):
-                url = f"https://www.airbnb.com{url}"
-            listings.append({
-                "title": title,
-                "price": price_el.get_text(strip=True) if price_el else None,
-                "rating": rating_el.get("aria-label") if rating_el else None,
-                "url": url,
-                "image": img_el.get("src") if img_el else None,
-            })
+            if not page_listings:
+                logger.info(f"No more listings found on page {page + 1}")
+                break
 
-    logger.info(f"Search completed: {len(listings)} results")
-    return {"listings": listings, "search_params": {"location": location}}
+            all_listings.extend(page_listings)
+            logger.info(f"Page {page + 1}: {len(page_listings)} listings found")
+
+    logger.info(f"Search completed: {len(all_listings)} total results across {min(page + 1, max_pages)} pages")
+    return {
+        "listings": all_listings,
+        "total_results": len(all_listings),
+        "search_params": {"location": location, "pages_fetched": min(page + 1, max_pages)},
+    }
 
 
 @base_app.post("/listing")
