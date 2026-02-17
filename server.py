@@ -166,6 +166,40 @@ def parse_listings_from_json(html: str) -> List[dict]:
             logger.warning(f"No listing data found anywhere in HTML ({len(html)} total chars)")
         return []
 
+    # Debug: explore the JSON structure
+    if isinstance(data, dict):
+        logger.info(f"Top-level keys: {list(data.keys())[:10]}")
+    elif isinstance(data, list):
+        logger.info(f"Top-level is list with {len(data)} items")
+
+    for path in [
+        "niobeMinimalClientData",
+        "niobeMinimalClientData.0",
+        "niobeMinimalClientData.0.1",
+        "niobeMinimalClientData.0.1.data",
+        "niobeMinimalClientData.0.1.data.presentation",
+        "niobeMinimalClientData.0.1.data.presentation.staysSearch",
+    ]:
+        obj = data
+        try:
+            for key in path.split("."):
+                if isinstance(obj, dict):
+                    obj = obj[key]
+                elif isinstance(obj, list) and key.isdigit():
+                    obj = obj[int(key)]
+                else:
+                    raise KeyError(key)
+            if isinstance(obj, dict):
+                logger.info(f"Path '{path}' => dict keys: {list(obj.keys())[:10]}")
+            elif isinstance(obj, list):
+                logger.info(f"Path '{path}' => list with {len(obj)} items")
+            else:
+                logger.info(f"Path '{path}' => type: {type(obj).__name__}, value preview: {str(obj)[:200]}")
+        except (KeyError, IndexError, TypeError):
+            logger.info(f"Path '{path}' => not found")
+
+    logger.info(f"JSON preview: {json.dumps(data, default=str)[:500]}")
+
     # Navigate to search results — try multiple known paths
     search_results = None
     for path_attempt in [
