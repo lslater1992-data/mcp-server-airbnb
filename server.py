@@ -169,42 +169,30 @@ def parse_listings_from_json(html: str) -> List[dict]:
     # Debug: explore the JSON structure
     if isinstance(data, dict):
         logger.info(f"Top-level keys: {list(data.keys())[:10]}")
-    elif isinstance(data, list):
-        logger.info(f"Top-level is list with {len(data)} items")
 
-    for path in [
-        "niobeMinimalClientData",
-        "niobeMinimalClientData.0",
-        "niobeMinimalClientData.0.1",
-        "niobeMinimalClientData.0.1.data",
-        "niobeMinimalClientData.0.1.data.presentation",
-        "niobeMinimalClientData.0.1.data.presentation.staysSearch",
-    ]:
-        obj = data
-        try:
-            for key in path.split("."):
-                if isinstance(obj, dict):
-                    obj = obj[key]
-                elif isinstance(obj, list) and key.isdigit():
-                    obj = obj[int(key)]
+    # Explore niobeClientData (not niobeMinimalClientData)
+    for niobe_key in ["niobeClientData", "niobeMinimalClientData"]:
+        niobe = data.get(niobe_key, []) if isinstance(data, dict) else []
+        if niobe:
+            logger.info(f"{niobe_key} has {len(niobe)} entries")
+            for i, entry in enumerate(niobe[:5]):
+                if isinstance(entry, list) and len(entry) >= 2:
+                    key = str(entry[0])[:100]
+                    val = entry[1]
+                    if isinstance(val, dict):
+                        logger.info(f"  Entry {i}: key='{key}', value keys={list(val.keys())[:10]}")
+                    else:
+                        logger.info(f"  Entry {i}: key='{key}', value type={type(val).__name__}")
                 else:
-                    raise KeyError(key)
-            if isinstance(obj, dict):
-                logger.info(f"Path '{path}' => dict keys: {list(obj.keys())[:10]}")
-            elif isinstance(obj, list):
-                logger.info(f"Path '{path}' => list with {len(obj)} items")
-            else:
-                logger.info(f"Path '{path}' => type: {type(obj).__name__}, value preview: {str(obj)[:200]}")
-        except (KeyError, IndexError, TypeError):
-            logger.info(f"Path '{path}' => not found")
-
-    logger.info(f"JSON preview: {json.dumps(data, default=str)[:500]}")
+                    logger.info(f"  Entry {i}: type={type(entry).__name__}, len={len(entry) if hasattr(entry, '__len__') else 'N/A'}")
 
     # Navigate to search results — try multiple known paths
     search_results = None
     for path_attempt in [
         lambda d: d["niobeMinimalClientData"][0][1]["data"]["presentation"]["staysSearch"]["results"]["searchResults"],
         lambda d: d["niobeMinimalClientData"][0][1]["data"]["presentation"]["explore"]["sections"]["sectionIndependentData"]["staysSearch"]["searchResults"],
+        lambda d: d["niobeClientData"][0][1]["data"]["presentation"]["staysSearch"]["results"]["searchResults"],
+        lambda d: d["niobeClientData"][0][1]["data"]["presentation"]["explore"]["sections"]["sectionIndependentData"]["staysSearch"]["searchResults"],
         lambda d: deep_find(d, "searchResults"),
     ]:
         try:
