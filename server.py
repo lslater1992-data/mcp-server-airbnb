@@ -1,7 +1,7 @@
 import os
 import re
 import logging
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from urllib.robotparser import RobotFileParser
 from typing import Optional, List
 
@@ -17,6 +17,14 @@ IGNORE_ROBOTS_TXT = os.environ.get("IGNORE_ROBOTS_TXT", "false").lower() == "tru
 PORT = int(os.environ.get("PORT", "8080"))
 BEARER_TOKEN = os.environ.get("LEX_BEARER_TOKEN", "test-token-123")
 AUTH_ENABLED = os.environ.get("LEX_ENABLE_AUTH", "false").lower() == "true"
+SCRAPEOPS_API_KEY = os.environ.get("SCRAPEOPS_API_KEY")
+
+
+def get_scrapeops_url(target_url: str) -> str:
+    """Route through ScrapeOps proxy if API key is configured."""
+    if SCRAPEOPS_API_KEY:
+        return f"https://proxy.scrapeops.io/v1/?api_key={SCRAPEOPS_API_KEY}&url={quote(target_url)}&render_js=1&residential=1"
+    return target_url
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("airbnb-mcp")
@@ -178,7 +186,8 @@ async def search_listings(
             search_url = f"https://www.airbnb.com/s/homes?{urlencode(page_params)}"
             logger.info(f"Fetching Airbnb search page {page + 1}: {search_url}")
 
-            response = await client.get(search_url, headers=HEADERS, follow_redirects=True, timeout=30.0)
+            fetch_url = get_scrapeops_url(search_url)
+            response = await client.get(fetch_url, headers=HEADERS, follow_redirects=True, timeout=60.0)
 
             if response.status_code != 200:
                 logger.warning(f"Page {page + 1} fetch failed: {response.status_code}")
@@ -214,8 +223,10 @@ async def get_listing(listing_id: str):
 
     logger.info(f"Fetching listing details: {listing_id}")
 
+    fetch_url = get_scrapeops_url(listing_url)
+
     async with httpx.AsyncClient() as client:
-        response = await client.get(listing_url, headers=HEADERS, follow_redirects=True, timeout=30.0)
+        response = await client.get(fetch_url, headers=HEADERS, follow_redirects=True, timeout=60.0)
 
     if response.status_code != 200:
         return {"error": f"Failed to fetch: {response.status_code}"}
