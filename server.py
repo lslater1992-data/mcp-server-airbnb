@@ -135,13 +135,11 @@ async def search_listings(
     pets: int = 0,
     max_pages: int = 1,
 ):
-    """Search Airbnb listings by location, dates, and filters. Use max_pages to fetch more results (each page has ~18 listings, max 3 pages)."""
+    """Search Airbnb listings by location, dates, and filters. Use max_pages to fetch more results (each page has ~18 listings). Stops automatically when no more results are found."""
     await ensure_robots()
 
     if max_pages < 1:
         max_pages = 1
-    if max_pages > 3:
-        max_pages = 3
 
     params = {"query": location}
     if checkin:
