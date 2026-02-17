@@ -197,7 +197,7 @@ async def search_listings(
             page_listings = parse_listings(soup)
 
             if not page_listings:
-                logger.info(f"No more listings found on page {page + 1}")
+                logger.warning(f"No listings found on page {page + 1}. HTML preview (first 5000 chars): {response.text[:5000]}")
                 break
 
             all_listings.extend(page_listings)
